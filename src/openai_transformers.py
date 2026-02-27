@@ -22,25 +22,20 @@ from .config import (
 def openai_request_to_gemini(openai_request: OpenAIChatCompletionRequest) -> Dict[str, Any]:
     """
     将 OpenAI 聊天请求转换为 Gemini 格式。
-    此版本经过修正，可正确处理所有消息角色，特别是 'tool' 角色。
+    此版本已精简，将 thinkingConfig 和 signature 逻辑交由 client builder 集中处理。
     """
     contents = []
-    model_name = openai_request.model.lower()
-    # 判断是否为需要强制签名的 Gemini 3.0 系列模型
-    is_gemini_3 = "gemini-3" in model_name
+    
     # ------------------------------------------------------------------
     #  1. 转换对话历史 (messages)
-    #     这是经过修正的核心逻辑
     # ------------------------------------------------------------------
     for message in openai_request.messages:
         role = message.role
         
         if role == "system":
-            # Gemini 将 system prompt 视为 user message
             contents.append({"role": "user", "parts": [{"text": str(message.content)}]})
 
         elif role == "user":
-            # 处理标准的用户消息 (可能包含多模态内容)
             if isinstance(message.content, list):
                 parts = []
                 for part in message.content:
@@ -67,93 +62,57 @@ def openai_request_to_gemini(openai_request: OpenAIChatCompletionRequest) -> Dic
                 contents.append({"role": "user", "parts": [{"text": str(message.content)}]})
 
         elif role == "assistant":
-            # 处理助手的回复 (可能包含文本和/或工具调用)
             parts = []
             if message.tool_calls:
                 for tc in message.tool_calls:
-                    func_call_part = {
+                    parts.append({
                         "functionCall": {
                             "name": tc.get("function", {}).get("name"),
                             "args": json.loads(tc.get("function", {}).get("arguments", "{}"))
                         }
-                    }
-                    if is_gemini_3:
-                        func_call_part["thoughtSignature"] = "skip_thought_signature_validator"
-
-                    parts.append(func_call_part)
+                    })
+                    # REMOVED: manual thoughtSignature injection (utils.py handles it now)
+            
             if message.content:
                 parts.append({"text": str(message.content)})
             
             if parts:
                 contents.append({"role": "model", "parts": parts})
+                
         elif role == "tool":
-
-            # 这是修复 400 错误的关键：将 'tool' 消息伪装成 'user' 消息
-
-            # 并且处理并行工具调用（Parallel Function Calling）的合并逻辑
-
             func_name = message.name
-
             if not func_name:
-
-                # 如果客户端没有在 tool message 中提供 name，我们必须回溯查找
-
                 for i in range(len(openai_request.messages) - 1, -1, -1):
-
                     prev_msg = openai_request.messages[i]
-
                     if prev_msg.role == "assistant" and prev_msg.tool_calls:
-
                         for tc in prev_msg.tool_calls:
-
                             if tc.get("id") == message.tool_call_id:
                                 func_name = tc.get("function", {}).get("name")
-
                                 break
-
                     if func_name:
                         break
 
-            # 构建新的 part
-
             new_part = {
-
                 "functionResponse": {
-
                     "name": func_name or "function_name_not_found",
-
                     "response": {"content": message.content}
-
                 }
-
             }
 
-            # 核心修改：检查上一条消息是否也是 functionResponse 类型的 user 消息
-
-            # 如果是，则合并到上一条消息的 parts 中，而不是创建新的消息
-
             if (contents and
-
                     contents[-1]["role"] == "user" and
-
                     "parts" in contents[-1] and
-
                     len(contents[-1]["parts"]) > 0 and
-
                     "functionResponse" in contents[-1]["parts"][-1]):
-
                 contents[-1]["parts"].append(new_part)
             else:
                 contents.append({
-
                     "role": "user",
-
                     "parts": [new_part]
-
                 })
 
     # ------------------------------------------------------------------
-    #  2. 转换 API 参数 (这部分逻辑保持不变)
+    #  2. 转换 API 参数
     # ------------------------------------------------------------------
     generation_config = {}
     if openai_request.temperature is not None:
@@ -180,7 +139,7 @@ def openai_request_to_gemini(openai_request: OpenAIChatCompletionRequest) -> Dic
             generation_config["responseMimeType"] = "application/json"
 
     # ------------------------------------------------------------------
-    #  3. 构建最终请求体 (这部分逻辑保持不变)
+    #  3. 构建最终请求体
     # ------------------------------------------------------------------
     request_payload = {
         "contents": contents,
@@ -191,13 +150,6 @@ def openai_request_to_gemini(openai_request: OpenAIChatCompletionRequest) -> Dic
     
     if is_search_model(openai_request.model):
         request_payload["tools"] = [{"googleSearch": {}}]
-    
-    thinking_budget = get_thinking_budget(openai_request.model)
-    if thinking_budget is not None:
-        request_payload["generationConfig"]["thinkingConfig"] = {
-            "thinkingBudget": thinking_budget,
-            "includeThoughts": should_include_thoughts(openai_request.model)
-        }
 
     # 处理工具声明 (Function Declarations)
     function_declarations = []
@@ -210,7 +162,8 @@ def openai_request_to_gemini(openai_request: OpenAIChatCompletionRequest) -> Dic
                     function_declarations.append(declaration)
 
     if function_declarations:
-        request_payload["tools"] = [{"functionDeclarations": function_declarations}]
+        request_payload["tools"] = request_payload.get("tools", [])
+        request_payload["tools"].append({"functionDeclarations": function_declarations})
 
     # 处理工具选择 (Tool Choice)
     tool_config = None
@@ -237,7 +190,6 @@ def openai_request_to_gemini(openai_request: OpenAIChatCompletionRequest) -> Dic
         request_payload["toolConfig"] = tool_config
     
     return request_payload
-
 
 def gemini_response_to_openai(gemini_response: Dict[str, Any], model: str) -> Dict[str, Any]:
     """

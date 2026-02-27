@@ -36,12 +36,16 @@ async def openai_chat_completions(
     
     try:
         logging.info(f"OpenAI chat completion request: model={request.model}, stream={request.stream}")
+        raw_body = await http_request.json()
         
         # Transform OpenAI request to Gemini format
         gemini_request_data = openai_request_to_gemini(request)
         
         # Build the payload for Google API
-        gemini_payload = build_gemini_payload_from_openai(gemini_request_data)
+        gemini_payload = build_gemini_payload_from_openai(
+            openai_payload=gemini_request_data, 
+            raw_openai_request=raw_body
+        )
         
     except Exception as e:
         logging.error(f"Error processing OpenAI request: {str(e)}")

@@ -4,15 +4,19 @@ This module is used by both OpenAI compatibility layer and native Gemini endpoin
 """
 import json
 import logging
+import datetime
+import threading
 import requests
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
-from .project_poller import get_next_project_id
-from .config import GEMINI_RETRY_COUNT
 
 from .auth import get_credentials, save_credentials, get_user_project_id, onboard_user
-from .utils import get_user_agent
+from .utils import (
+    get_user_agent,
+    sanitize_historical_signatures,
+    apply_scorched_earth_thinking_config
+)
 from .config import (
     CODE_ASSIST_ENDPOINT,
     DEFAULT_SAFETY_SETTINGS,
@@ -22,302 +26,109 @@ from .config import (
     should_include_thoughts
 )
 import asyncio
-from datetime import date
-import threading
 
-# 使用全局字典在内存中存储统计信息
-usage_stats = {
-    "last_reset_date": date.today(),
+_stats_lock = threading.Lock()
+_daily_stats = {
+    "last_reset_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
     "total_success": 0,
     "total_fail": 0,
-    "accounts": {}  # key: project_id, value: {"success": 0, "fail": 0}
+    "total": 0,
+    "accounts": {}
 }
-# 线程锁，用于保证并发请求时数据更新的原子性
-stats_lock = threading.Lock()
-
-
-def _check_and_reset_stats():
-    """检查日期，如果到了新的一天，则重置所有计数器。必须在锁内调用。"""
-    global usage_stats
-    today = date.today()
-    if usage_stats["last_reset_date"] != today:
-        logging.info(f"New day detected. Resetting usage statistics from {usage_stats['last_reset_date']} to {today}.")
-        usage_stats = {
-            "last_reset_date": today,
-            "total_success": 0,
-            "total_fail": 0,
-            "accounts": {}
-        }
-
-
-def record_usage(project_id: str, success: bool):
-    """记录一次API调用（成功或失败）。这是一个线程安全的函数。"""
-    if not project_id:  # 防止 project_id 为 None 时出错
-        project_id = "unknown_project"
-    with stats_lock:
-        _check_and_reset_stats()
-        usage_stats["accounts"].setdefault(project_id, {"success": 0, "fail": 0})
-
-        if success:
-            usage_stats["total_success"] += 1
-            usage_stats["accounts"][project_id]["success"] += 1
-        else:
-            usage_stats["total_fail"] += 1
-            usage_stats["accounts"][project_id]["fail"] += 1
-
-
-def get_usage_stats_snapshot() -> dict:
-    """获取结构化统计信息（线程安全），用于仪表盘 API。"""
-    with stats_lock:
-        _check_and_reset_stats()
-        stats_copy = usage_stats.copy()
-        accounts_copy = stats_copy["accounts"].copy()
-
-    account_items = []
-    for project_id, counts in sorted(accounts_copy.items()):
-        success = int(counts.get("success", 0))
-        fail = int(counts.get("fail", 0))
-        account_items.append(
-            {
-                "project_id": str(project_id),
-                "success": success,
-                "fail": fail,
-                "total": success + fail,
-            }
-        )
-
-    return {
-        "last_reset_date": str(stats_copy["last_reset_date"]),
-        "total_success": int(stats_copy.get("total_success", 0)),
-        "total_fail": int(stats_copy.get("total_fail", 0)),
-        "total": int(stats_copy.get("total_success", 0)) + int(stats_copy.get("total_fail", 0)),
-        "accounts": account_items,
-    }
-
-
-def get_formatted_stats() -> str:
-    """获取格式化为文本表格的统计信息字符串。这是一个线程安全的函数。"""
-    snapshot = get_usage_stats_snapshot()
-
-    header = (
-        f"--- Daily Usage Statistics (Last Reset: {snapshot['last_reset_date']}) ---\n"
-        f"Overall: {snapshot['total_success']} Success, {snapshot['total_fail']} Fail\n"
-        f"{'-' * 60}\n"
-        f"| {'Project ID'.ljust(35)} | {'Success'.rjust(7)} | {'Fail'.rjust(7)} |\n"
-        f"|{'-' * 37}|{'-' * 9}|{'-' * 9}|\n"
-    )
-
-    body = ""
-    if not snapshot["accounts"]:
-        body = "| No account usage recorded today.                                  |\n"
-    else:
-        for item in snapshot["accounts"]:
-            body += f"| {item['project_id'].ljust(35)} | {str(item['success']).rjust(7)} | {str(item['fail']).rjust(7)} |\n"
-
-    footer = f"{'-' * 60}"
-    return header + body + footer
-
 
 def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     """
-    Send a request to Google's Gemini API with retry and project polling logic.
-
+    Send a request to Google's Gemini API.
+    
     Args:
         payload: The request payload in Gemini format
         is_streaming: Whether this is a streaming request
-
+        
     Returns:
         FastAPI Response object
     """
-    # ===================== MODIFY START =====================
-    last_error_response = None
-    last_used_proj_id = None  # 用于在最终失败时记录
-
-    # Total attempts = 1 (initial) + GEMINI_RETRY_COUNT
-    for attempt in range(GEMINI_RETRY_COUNT + 1):
-        # 功能一：每次重试都获取一个新账号凭据
-        creds = get_credentials()
-        if not creds:
-            logging.error(f"Attempt {attempt + 1}: Failed to get credentials.")
-            if attempt < GEMINI_RETRY_COUNT:
-                continue
-            else:
-                last_error_response = Response(
-                    content="Authentication failed. Could not retrieve any valid credentials.",
-                    status_code=500
-                )
-                break
-
-        # Refresh credentials if needed
-        if creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(GoogleAuthRequest())
-                save_credentials(creds)
-            except Exception as e:
-                logging.warning(f"Attempt {attempt + 1}: Token refresh failed for an account. Trying next. Error: {e}")
-                if attempt < GEMINI_RETRY_COUNT:
-                    continue
-                else:
-                    last_error_response = Response(
-                        content="Token refresh failed. Please restart the proxy to re-authenticate.",
-                        status_code=500
-                    )
-                    break
-        elif not creds.token:
-            logging.warning(f"Attempt {attempt + 1}: Account has no access token. Trying next one.")
-            if attempt < GEMINI_RETRY_COUNT:
-                continue
-            else:
-                last_error_response = Response(
-                    content="No access token. Please restart the proxy to re-authenticate.",
-                    status_code=500
-                )
-                break
-
-        # 使用与凭据绑定的项目ID，而不是轮询独立的列表
-        proj_id = get_user_project_id(creds)
-        last_used_proj_id = proj_id
-
-        logging.info(f"Attempt {attempt + 1}/{GEMINI_RETRY_COUNT + 1}: Using account for project: {proj_id}")
-        if not proj_id:
-            logging.error("Failed to get a valid user project ID for this attempt.")
-            if attempt < GEMINI_RETRY_COUNT:
-                continue  # 尝试下一个账号
-            else:
-                last_error_response = Response(content="Could not determine project ID for any account.",
-                                               status_code=500)
-                break
-
-        onboard_user(creds, proj_id)
-
-        # Build the final payload with the current project info
-        final_payload = {
-            "model": payload.get("model"),
-            "project": proj_id,
-            "request": payload.get("request", {})
-        }
-        final_post_data = json.dumps(final_payload)
-
-        # Determine the action and URL
-        action = "streamGenerateContent" if is_streaming else "generateContent"
-        target_url = f"{CODE_ASSIST_ENDPOINT}/v1internal:{action}"
-        if is_streaming:
-            target_url += "?alt=sse"
-
-        # Build request headers
-        request_headers = {
-            "Authorization": f"Bearer {creds.token}",
-            "Content-Type": "application/json",
-            "User-Agent": get_user_agent(),
-        }
-
-        try:
-            if is_streaming:
-                resp = requests.post(target_url, data=final_post_data, headers=request_headers, stream=True)
-            else:
-                resp = requests.post(target_url, data=final_post_data, headers=request_headers)
-
-            # Check for retry conditions
-            is_429 = resp.status_code == 429
-            is_403 = resp.status_code == 403
-            is_404 = resp.status_code == 404
-            is_empty_reply = False
-
-            # Check for empty reply only on non-streaming, successful requests
-            if not is_streaming and resp.status_code == 200:
-                try:
-                    # Peek into the response content to check if it's effectively empty
-                    resp_text = resp.text
-                    if resp_text.startswith('data: '):
-                        resp_text = resp_text[len('data: '):]
-
-                    if not resp_text.strip():
-                        is_empty_reply = True
-                    else:
-                        api_response = json.loads(resp_text)
-                        gemini_response = api_response.get("response", {})
-                        candidates = gemini_response.get("candidates", [])
-
-                        if candidates:
-                            parts = candidates[0].get("content", {}).get("parts", [])
-                            has_main_text = any("text" in p and not p.get("thought") for p in parts)
-                            has_tool_call = any("functionCall" in p for p in parts)
-
-                            if not has_main_text and not has_tool_call:
-                                is_empty_reply = True
-                        else:
-                            is_empty_reply = True
-
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    pass
-
-            if is_429 or is_403 or is_404 or is_empty_reply:
-                reason = (
-                    "status 429" if is_429
-                    else ("status 403" if is_403 else ("status 404" if is_404 else "empty reply"))
-                )
-
-                upstream_message = None
-                try:
-                    error_data = resp.json()
-                    if isinstance(error_data, dict):
-                        upstream_message = error_data.get("error", {}).get("message")
-                except (json.JSONDecodeError, ValueError, AttributeError):
-                    pass
-
-                upstream_body = (resp.text or "")
-
-                if upstream_body:
-                    logging.warning(
-                        f"Attempt {attempt + 1} failed due to {reason}. status={resp.status_code}, "
-                        f"upstream_message={upstream_message or ''}, upstream_body={upstream_body} Retrying..."
-                    )
-                else:
-                    logging.warning(
-                        f"Attempt {attempt + 1} failed due to {reason}. status={resp.status_code}, "
-                        f"upstream_message={upstream_message or ''}. Retrying..."
-                    )
-
-                last_error_response = resp
-                if attempt < GEMINI_RETRY_COUNT:
-                    continue
-                else:
-                    break
-
-                    # If successful, handle and return immediately
-            # 功能二：记录成功调用
-            record_usage(proj_id, success=True)
-            if is_streaming:
-                return _handle_streaming_response(resp)
-            else:
-                return _handle_non_streaming_response(resp)
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Request to Google API failed on attempt {attempt + 1}: {str(e)}")
-            error_content = json.dumps(
-                {"error": {"message": f"Request failed: {str(e)}", "type": "api_connection_error"}})
-            last_error_response = Response(content=error_content, status_code=502, media_type="application/json")
-            if attempt < GEMINI_RETRY_COUNT:
-                continue
-            else:
-                break
-
-    # If the loop finishes without a successful return, all retries have failed.
-    logging.error("All retry attempts failed.")
-    # 功能二：记录失败调用
-    record_usage(last_used_proj_id, success=False)
-
-    if last_error_response:
-        # Return the last captured error response
-        return _handle_non_streaming_response(last_error_response)
-    else:
-        # Fallback error if no response was ever received
+    # Get and validate credentials
+    creds = get_credentials()
+    if not creds:
         return Response(
-            content=json.dumps({"error": {"message": "All retry attempts failed to connect to the upstream server."}}),
-            status_code=503,
-            media_type="application/json"
+            content="Authentication failed. Please restart the proxy to log in.", 
+            status_code=500
+        )
+    
+    # Refresh credentials if needed
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GoogleAuthRequest())
+            save_credentials(creds)
+        except Exception as e:
+            return Response(
+                content="Token refresh failed. Please restart the proxy to re-authenticate.", 
+                status_code=500
+            )
+    elif not creds.token:
+        return Response(
+            content="No access token. Please restart the proxy to re-authenticate.", 
+            status_code=500
         )
 
+    # Get project ID and onboard user
+    proj_id = get_user_project_id(creds)
+    if not proj_id:
+        return Response(content="Failed to get user project ID.", status_code=500)
+    
+    onboard_user(creds, proj_id)
+
+    # Build the final payload with project info
+    final_payload = {
+        "model": payload.get("model"),
+        "project": proj_id,
+        "request": payload.get("request", {})
+    }
+
+    # Determine the action and URL
+    action = "streamGenerateContent" if is_streaming else "generateContent"
+    target_url = f"{CODE_ASSIST_ENDPOINT}/v1internal:{action}"
+    if is_streaming:
+        target_url += "?alt=sse"
+
+    # Build request headers
+    request_headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json",
+        "User-Agent": get_user_agent(),
+    }
+
+    final_post_data = json.dumps(final_payload)
+
+    # Send the request
+    try:
+        if is_streaming:
+            resp = requests.post(target_url, data=final_post_data, headers=request_headers, stream=True)
+            # Record stat based on initial HTTP status
+            record_usage(proj_id, resp.status_code == 200)
+            return _handle_streaming_response(resp)
+        else:
+            resp = requests.post(target_url, data=final_post_data, headers=request_headers)
+            # Record stat based on initial HTTP status
+            record_usage(proj_id, resp.status_code == 200)
+            return _handle_non_streaming_response(resp)
+            
+    except requests.exceptions.RequestException as e:
+        record_usage(proj_id, False)
+        logging.error(f"Request to Google API failed: {str(e)}")
+        return Response(
+            content=json.dumps({"error": {"message": f"Request failed: {str(e)}"}}),
+            status_code=500,
+            media_type="application/json"
+        )
+    except Exception as e:
+        record_usage(proj_id, False)
+        logging.error(f"Unexpected error during Google API request: {str(e)}")
+        return Response(
+            content=json.dumps({"error": {"message": f"Unexpected error: {str(e)}"}}),
+            status_code=500,
+            media_type="application/json"
+        )
 
 def _handle_streaming_response(resp) -> StreamingResponse:
     """Handle streaming response from Google API."""
@@ -478,26 +289,40 @@ def _handle_non_streaming_response(resp) -> Response:
         )
 
 
-def build_gemini_payload_from_openai(openai_payload: dict) -> dict:
+def build_gemini_payload_from_openai(openai_payload: dict, raw_openai_request: dict = None) -> dict:
     """
     Build a Gemini API payload from an OpenAI-transformed request.
     This is used when OpenAI requests are converted to Gemini format.
     """
-    # Extract model from the payload
     model = openai_payload.get("model")
-    
-    # Get safety settings or use defaults
     safety_settings = openai_payload.get("safetySettings", DEFAULT_SAFETY_SETTINGS)
     
-    # Build the request portion
+    # Sanitize historical messages for the signature bypass
+    contents = openai_payload.get("contents")
+    if contents:
+        contents = sanitize_historical_signatures(contents)
+        
+    generation_config = openai_payload.get("generationConfig", {})
+    
+    # Extract reasoning_effort if the proxy captured the original raw request
+    reasoning_effort = None
+    if raw_openai_request and "reasoning_effort" in raw_openai_request:
+        reasoning_effort = raw_openai_request.get("reasoning_effort")
+        
+    # Apply the scorched earth thinking logic
+    generation_config = apply_scorched_earth_thinking_config(
+        generation_config=generation_config,
+        openai_reasoning_effort=reasoning_effort
+    )
+    
     request_data = {
-        "contents": openai_payload.get("contents"),
+        "contents": contents,
         "systemInstruction": openai_payload.get("systemInstruction"),
         "cachedContent": openai_payload.get("cachedContent"),
         "tools": openai_payload.get("tools"),
         "toolConfig": openai_payload.get("toolConfig"),
         "safetySettings": safety_settings,
-        "generationConfig": openai_payload.get("generationConfig", {}),
+        "generationConfig": generation_config,
     }
     
     # Remove any keys with None values
@@ -519,20 +344,20 @@ def build_gemini_payload_from_native(native_request: dict, model_from_path: str)
     if "generationConfig" not in native_request:
         native_request["generationConfig"] = {}
         
-    # native_request["enableEnhancedCivicAnswers"] = False
+    # Sanitize historical messages so past thoughts/tools don't break the validator
+    if "contents" in native_request:
+        native_request["contents"] = sanitize_historical_signatures(native_request["contents"])
     
-    if "thinkingConfig" not in native_request["generationConfig"]:
-        native_request["generationConfig"]["thinkingConfig"] = {}
-    
-    # Configure thinking based on model variant
-    thinking_budget = get_thinking_budget(model_from_path)
-    include_thoughts = should_include_thoughts(model_from_path)
-    
-    native_request["generationConfig"]["thinkingConfig"]["includeThoughts"] = include_thoughts
-    if "thinkingBudget" in native_request["generationConfig"]["thinkingConfig"] and thinking_budget == -1:
-        pass
-    else:
-        native_request["generationConfig"]["thinkingConfig"]["thinkingBudget"] = thinking_budget
+    if "gemini-2.5-flash-image" not in model_from_path:
+        thinking_budget = get_thinking_budget(model_from_path)
+        include_thoughts = should_include_thoughts(model_from_path)
+        
+        # Apply the scorched earth thinking logic
+        native_request["generationConfig"] = apply_scorched_earth_thinking_config(
+            generation_config=native_request["generationConfig"],
+            fallback_budget=thinking_budget,
+            fallback_include=include_thoughts
+        )
     
     # Add Google Search grounding for search models
     if is_search_model(model_from_path):
@@ -546,3 +371,49 @@ def build_gemini_payload_from_native(native_request: dict, model_from_path: str)
         "model": get_base_model_name(model_from_path),  # Use base model name for API call
         "request": native_request
     }
+
+def record_usage(project_id: str, success: bool):
+    """Safely increments the usage statistics for the dashboard."""
+    with _stats_lock:
+        current_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        
+        # Reset stats daily
+        if _daily_stats["last_reset_date"] != current_date:
+            _daily_stats["last_reset_date"] = current_date
+            _daily_stats["total_success"] = 0
+            _daily_stats["total_fail"] = 0
+            _daily_stats["total"] = 0
+            _daily_stats["accounts"] = {}
+            
+        _daily_stats["total"] += 1
+        
+        if project_id not in _daily_stats["accounts"]:
+            _daily_stats["accounts"][project_id] = {"success": 0, "fail": 0, "total": 0}
+            
+        _daily_stats["accounts"][project_id]["total"] += 1
+        
+        if success:
+            _daily_stats["total_success"] += 1
+            _daily_stats["accounts"][project_id]["success"] += 1
+        else:
+            _daily_stats["total_fail"] += 1
+            _daily_stats["accounts"][project_id]["fail"] += 1
+
+def get_usage_stats_snapshot() -> dict:
+    """Returns a snapshot of the current usage stats for the dashboard."""
+    with _stats_lock:
+        accounts_list = [
+            {"project_id": pid, **stats}
+            for pid, stats in _daily_stats["accounts"].items()
+        ]
+        return {
+            "last_reset_date": _daily_stats["last_reset_date"],
+            "total_success": _daily_stats["total_success"],
+            "total_fail": _daily_stats["total_fail"],
+            "total": _daily_stats["total"],
+            "accounts": accounts_list
+        }
+
+def get_formatted_stats() -> dict:
+    """Returns the stats formatted for the root endpoint."""
+    return get_usage_stats_snapshot()
