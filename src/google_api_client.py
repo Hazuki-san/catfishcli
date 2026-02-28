@@ -3,6 +3,7 @@ Google API Client - Handles all communication with Google's Gemini API.
 This module is used by both OpenAI compatibility layer and native Gemini endpoints.
 """
 import json
+import time
 import logging
 import datetime
 import threading
@@ -47,7 +48,10 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     Returns:
         FastAPI Response object
     """
-    max_retries = min(len(ACCOUNTS), 3) if ACCOUNTS else 1
+    num_accounts = len(ACCOUNTS) if ACCOUNTS else 1
+    # First pass: instant, try every account
+    # Second pass: with delay, in case quotas reset
+    max_retries = num_accounts * 2
 
     for attempt in range(max_retries):
         creds = get_credentials()
@@ -91,13 +95,22 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
                 stream=is_streaming,
             )
 
-            # Retry on 429 with next account
             if resp.status_code == 429 and attempt < max_retries - 1:
                 record_usage(proj_id, False)
-                logging.warning(
-                    f"429 rate limited on project {proj_id}. "
-                    f"Retrying with next account ({attempt + 1}/{max_retries})..."
-                )
+
+                # Second pass through accounts — add delay to let quota reset
+                if attempt >= num_accounts:
+                    delay = min(2 ** (attempt - num_accounts), 10)  # 1s, 2s, 4s, 8s, cap 10s
+                    logging.warning(
+                        f"429 on project {proj_id}. "
+                        f"Retry {attempt + 1}/{max_retries}, waiting {delay}s..."
+                    )
+                    time.sleep(delay)
+                else:
+                    logging.warning(
+                        f"429 on project {proj_id}. "
+                        f"Trying next account ({attempt + 1}/{max_retries})..."
+                    )
                 continue
 
             record_usage(proj_id, resp.status_code == 200)
@@ -118,9 +131,8 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
                 media_type="application/json",
             )
 
-    # Should never reach here, but just in case
     return Response(
-        content=json.dumps({"error": {"message": "All accounts exhausted."}}),
+        content=json.dumps({"error": {"message": "All retry attempts exhausted (429)."}}),
         status_code=429,
         media_type="application/json",
     )
