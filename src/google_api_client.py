@@ -95,7 +95,10 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     request_headers = {
         "Authorization": f"Bearer {creds.token}",
         "Content-Type": "application/json",
-        "User-Agent": get_user_agent(),
+        #"User-Agent": get_user_agent(),
+        "User-Agent": "google-api-nodejs-client/9.15.1",
+        "X-Goog-Api-Client": "gl-node/22.17.0",
+        "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI"
     }
 
     final_post_data = json.dumps(final_payload)
