@@ -24,38 +24,52 @@ from .config import (
 
 # --- Global State for Account Polling ---
 ACCOUNTS = []
-account_cycler = None
-onboarding_complete_map = {}  # Track onboarding status per project_id
+_account_lock = threading.Lock()
+_account_index = 0
+onboarding_complete_map = {}
 file_lock = threading.Lock()
 
 security = HTTPBasic()
 
+def _get_next_account() -> dict | None:
+    """Thread-safe round-robin account selection."""
+    global _account_index
+    with _account_lock:
+        if not ACCOUNTS:
+            return None
+        account = ACCOUNTS[_account_index]
+        _account_index = (_account_index + 1) % len(ACCOUNTS)
+        return account
+
 def _load_accounts():
-    """Loads all accounts from the credential file and prepares the cycler."""
-    global ACCOUNTS, account_cycler
+    """Loads all accounts from the credential file and prepares the state."""
+    global ACCOUNTS
     if not os.path.exists(CREDENTIAL_FILE):
-        logging.warning(f"Credential file not found at {CREDENTIAL_FILE}. Server started - authentication will be required on first request.")
+        logging.warning(
+            f"Credential file not found at {CREDENTIAL_FILE}. "
+            f"Server started - authentication will be required on first request."
+        )
         return
 
     try:
         with open(CREDENTIAL_FILE, "r") as f:
             creds_data = json.load(f)
-        
+
+        # Normalize: always work with a list internally
+        if isinstance(creds_data, dict):
+            creds_data = [creds_data]
+
         if isinstance(creds_data, list) and creds_data:
             ACCOUNTS = creds_data
-            account_cycler = itertools.cycle(ACCOUNTS)
-            logging.info(f"Successfully loaded {len(ACCOUNTS)} accounts for polling.")
-        elif isinstance(creds_data, dict):
-             # Support single account format for backward compatibility
-            ACCOUNTS = [creds_data]
-            account_cycler = itertools.cycle(ACCOUNTS)
-            logging.info("Successfully loaded 1 account.")
+            logging.info(f"Successfully loaded {len(ACCOUNTS)} account(s).")
         else:
-            logging.error("Credential file is not a valid JSON array of accounts or a single account object.")
+            logging.error(
+                "Credential file is not a valid JSON array or object."
+            )
     except json.JSONDecodeError as e:
         logging.error(f"Failed to parse credentials file {CREDENTIAL_FILE}: {e}")
     except Exception as e:
-        logging.error(f"An unexpected error occurred while loading accounts: {e}")
+        logging.error(f"Unexpected error loading accounts: {e}")
 
 # Load accounts when the module is first imported (i.e., when a worker process starts)
 _load_accounts()
@@ -152,82 +166,93 @@ def save_credentials(creds, project_id=None):
 
         try:
             with open(CREDENTIAL_FILE, "w") as f:
-                # If there was only one account originally, save it as an object, otherwise as an array
-                if len(current_accounts) == 1:
-                    json.dump(current_accounts[0], f, indent=2)
-                else:
-                    json.dump(current_accounts, f, indent=2)
+                json.dump(current_accounts, f, indent=2)
             logging.info(f"Successfully saved refreshed token for project {project_id or 'unknown'}.")
         except Exception as e:
             logging.error(f"Failed to write updated credentials to file: {e}")
 
-
 def get_credentials(allow_oauth_flow=True):
     """
-    Gets the next available account's credentials from the polling cycle.
-    Handles token refresh and persists the new token.
+    Gets the next available account's credentials with failover.
+    Tries each account at most once before giving up.
     """
-    global account_cycler
-    if not account_cycler:
-        # This fallback is for when the file was missing at startup, and the user logs in manually
+    if not ACCOUNTS:
         return _manual_oauth_flow() if allow_oauth_flow else None
 
-    # Get the next account from the cycle
-    selected_account = next(account_cycler)
-    
-    try:
-        # The google-auth library expects specific keys, we ensure they exist.
-        creds_info = selected_account.copy()
-        if 'access_token' in creds_info and 'token' not in creds_info:
-            creds_info['token'] = creds_info['access_token']
-        if 'scope' in creds_info and 'scopes' not in creds_info:
-            creds_info['scopes'] = creds_info['scope'].split()
-        
-        credentials = Credentials.from_authorized_user_info(creds_info, SCOPES)
-        
-        # Refresh credentials if needed
-        if credentials.expired and credentials.refresh_token:
-            try:
-                logging.info(f"Token for project {selected_account.get('project_id')} expired. Refreshing...")
-                credentials.refresh(GoogleAuthRequest())
-                # Persist the newly refreshed token
-                save_credentials(credentials, selected_account.get('project_id'))
-            except Exception as e:
-                logging.error(f"Failed to refresh token for project {selected_account.get('project_id')}: {e}")
-                # Potentially remove this account from the cycle or mark as bad, but for now just log and continue
-        
-        return credentials
+    attempts = len(ACCOUNTS)
 
-    except Exception as e:
-        logging.error(f"Failed to create credentials from account data {selected_account.get('project_id')}: {e}")
-        return None
+    for _ in range(attempts):
+        selected_account = _get_next_account()
+        if selected_account is None:
+            break
 
+        try:
+            creds_info = selected_account.copy()
+            if 'access_token' in creds_info and 'token' not in creds_info:
+                creds_info['token'] = creds_info['access_token']
+            if 'scope' in creds_info and 'scopes' not in creds_info:
+                creds_info['scopes'] = creds_info['scope'].split()
+
+            credentials = Credentials.from_authorized_user_info(creds_info, SCOPES)
+
+            if credentials.expired and credentials.refresh_token:
+                project_id = selected_account.get('project_id', 'unknown')
+                logging.info(f"Token for project {project_id} expired. Refreshing...")
+                try:
+                    credentials.refresh(GoogleAuthRequest())
+                    save_credentials(credentials, project_id)
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to refresh token for project {project_id}: {e}. "
+                        f"Trying next account..."
+                    )
+                    continue
+
+            if not credentials.token:
+                logging.warning(
+                    f"No valid token for project {selected_account.get('project_id', 'unknown')}. "
+                    f"Trying next account..."
+                )
+                continue
+
+            return credentials
+
+        except Exception as e:
+            logging.error(
+                f"Failed to create credentials for project "
+                f"{selected_account.get('project_id', 'unknown')}: {e}. "
+                f"Trying next account..."
+            )
+            continue  # ← failover to next account
+
+    logging.error("All accounts exhausted. No valid credentials available.")
+    return None
 
 def get_user_project_id(creds):
     """
-    Gets the user's project ID. It now prioritizes the project ID from the
-    account that was just selected by the polling mechanism.
+    Gets the user's project ID.
+    For multi-account setups, always uses the account's own project_id.
+    Env var override only applies to single-account setups.
     """
-    # Priority 1: Environment variable always takes precedence
-    env_project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
-    if env_project_id:
-        logging.info(f"Using project ID from GOOGLE_CLOUD_PROJECT environment variable: {env_project_id}")
-        return env_project_id
+    # Only use env var for single-account setups
+    if len(ACCOUNTS) <= 1:
+        env_project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+        if env_project_id:
+            logging.info(f"Using project ID from GOOGLE_CLOUD_PROJECT: {env_project_id}")
+            return env_project_id
 
-    # Priority 2: Find the project_id from the account matching the current credentials
+    # Match project_id from the account that was selected by the rotation
     if creds and creds.refresh_token:
         with file_lock:
-            # CORRECTED INDENTATION ON THE LINE BELOW
             for acc in ACCOUNTS:
                 if acc.get("refresh_token") == creds.refresh_token:
                     if acc.get("project_id"):
                         logging.info(f"Using project_id for this request: {acc['project_id']}")
                         return acc["project_id"]
-                    # If account is found but no project_id, break to use API discovery
                     break
-    
-    # Priority 3: Fallback to API discovery if project_id is missing in the file
-    logging.warning("Could not find project_id in the selected account data, attempting API discovery.")
+
+    # Fallback: API discovery
+    logging.warning("No project_id found in account data, attempting API discovery.")
     try:
         import requests
         headers = {
@@ -246,15 +271,12 @@ def get_user_project_id(creds):
         discovered_project_id = data.get("cloudaicompanionProject")
         if discovered_project_id:
             logging.info(f"Discovered project ID via API: {discovered_project_id}")
-            # Save the discovered project_id back to the file for future use
             save_credentials(creds, discovered_project_id)
-            logging.info(f"Using project_id for this request: {discovered_project_id}")
             return discovered_project_id
         else:
-            raise ValueError("Could not find 'cloudaicompanionProject' in loadCodeAssist response.")
+            raise ValueError("No 'cloudaicompanionProject' in response.")
     except Exception as e:
-        raise Exception(f"Failed to discover project ID via API: {e}")
-
+        raise Exception(f"Failed to discover project ID: {e}")
 
 def onboard_user(creds, project_id):
     """Ensures the user is onboarded, matching gemini-cli setupUser behavior."""
@@ -386,13 +408,17 @@ def _manual_oauth_flow():
             logging.error(f"Could not discover project ID during initial login: {e}")
 
         # Save as a single object in the file
-        creds_data = {
-            "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "token": new_creds.token,
-            "refresh_token": new_creds.refresh_token, "scopes": new_creds.scopes,
+        creds_data = [{
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "token": new_creds.token,
+            "refresh_token": new_creds.refresh_token,
+            "scopes": list(new_creds.scopes) if new_creds.scopes else [],
             "token_uri": "https://oauth2.googleapis.com/token",
             "expiry": new_creds.expiry.isoformat(),
-            "project_id": proj_id
-        }
+            "project_id": proj_id,
+        }]
+
         with open(CREDENTIAL_FILE, "w") as f:
             json.dump(creds_data, f, indent=2)
         
@@ -401,4 +427,87 @@ def _manual_oauth_flow():
         return new_creds
     except Exception as e:
         logging.error(f"Authentication failed: {e}")
+        return None
+
+def add_account_via_oauth() -> dict | None:
+    """
+    Runs the OAuth flow to add a NEW account to the existing credentials file.
+    Returns the new account dict or None on failure.
+    """
+    client_config = {
+        "installed": {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+    flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri="http://localhost:8989")
+    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent", include_granted_scopes="true")
+
+    print(f"\n{'='*80}")
+    print(f"ADD ACCOUNT - Open this URL in your browser:")
+    print(f"{auth_url}")
+    print(f"{'='*80}\n")
+    logging.info(f"Add account URL: {auth_url}")
+
+    _OAuthCallbackHandler.auth_code = None
+    server = HTTPServer(("", 8989), _OAuthCallbackHandler)
+    server.handle_request()
+
+    auth_code = _OAuthCallbackHandler.auth_code
+    if not auth_code:
+        return None
+
+    try:
+        flow.fetch_token(code=auth_code)
+        new_creds = flow.credentials
+
+        # Check for duplicate refresh token
+        with file_lock:
+            for acc in ACCOUNTS:
+                if acc.get("refresh_token") == new_creds.refresh_token:
+                    logging.warning("This account is already registered.")
+                    return acc
+
+        # Discover project ID
+        try:
+            proj_id = get_user_project_id(new_creds)
+        except Exception as e:
+            proj_id = None
+            logging.error(f"Could not discover project ID: {e}")
+
+        new_account = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "token": new_creds.token,
+            "refresh_token": new_creds.refresh_token,
+            "scopes": list(new_creds.scopes) if new_creds.scopes else [],
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "expiry": new_creds.expiry.isoformat() if new_creds.expiry else None,
+            "project_id": proj_id,
+        }
+
+        # Append to file
+        with file_lock:
+            try:
+                with open(CREDENTIAL_FILE, "r") as f:
+                    current = json.load(f)
+                    if not isinstance(current, list):
+                        current = [current]
+            except (FileNotFoundError, json.JSONDecodeError):
+                current = []
+
+            current.append(new_account)
+
+            with open(CREDENTIAL_FILE, "w") as f:
+                json.dump(current, f, indent=2)
+
+        # Reload accounts into memory
+        _load_accounts()
+        logging.info(f"Successfully added new account. Project: {proj_id}. Total accounts: {len(ACCOUNTS)}")
+        return new_account
+
+    except Exception as e:
+        logging.error(f"Failed to add account: {e}")
         return None

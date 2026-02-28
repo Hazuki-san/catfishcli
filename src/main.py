@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from .gemini_routes import router as gemini_router
 from .openai_routes import router as openai_router
-from .auth import get_credentials, get_user_project_id, onboard_user, get_accounts_status_snapshot
+from .auth import get_credentials, get_user_project_id, onboard_user, get_accounts_status_snapshot, add_account_via_oauth
 from .google_api_client import get_formatted_stats, get_usage_stats_snapshot
 from . import dashboard_monitor
 from .config import DASHBOARD_TOKEN, CREDENTIAL_FILE
@@ -280,6 +280,26 @@ async def handle_preflight(request: Request, full_path: str):
         }
     )
 
+@app.post("/auth/add")
+async def add_account(request: Request):
+    """Trigger OAuth flow to add a new Google account."""
+    _verify_dashboard_token(request)
+
+    # Run the blocking OAuth flow in a thread so FastAPI doesn't hang
+    result = await asyncio.to_thread(add_account_via_oauth)
+
+    if result:
+        return {
+            "status": "success",
+            "project_id": result.get("project_id"),
+            "total_accounts": len(ACCOUNTS),
+        }
+    else:
+        return Response(
+            content=json.dumps({"status": "failed", "message": "OAuth flow failed or was cancelled"}),
+            status_code=400,
+            media_type="application/json",
+        )
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):

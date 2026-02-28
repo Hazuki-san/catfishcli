@@ -47,91 +47,83 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     Returns:
         FastAPI Response object
     """
-    # Get and validate credentials
-    creds = get_credentials()
-    if not creds:
-        return Response(
-            content="Authentication failed. Please restart the proxy to log in.", 
-            status_code=500
-        )
-    
-    # Refresh credentials if needed
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(GoogleAuthRequest())
-            save_credentials(creds)
-        except Exception as e:
+    max_retries = min(len(ACCOUNTS), 3) if ACCOUNTS else 1
+
+    for attempt in range(max_retries):
+        creds = get_credentials()
+        if not creds or not creds.token:
             return Response(
-                content="Token refresh failed. Please restart the proxy to re-authenticate.", 
-                status_code=500
+                content=json.dumps({"error": {"message": "No valid credentials available."}}),
+                status_code=500,
+                media_type="application/json",
             )
-    elif not creds.token:
-        return Response(
-            content="No access token. Please restart the proxy to re-authenticate.", 
-            status_code=500
-        )
 
-    # Get project ID and onboard user
-    proj_id = get_user_project_id(creds)
-    if not proj_id:
-        return Response(content="Failed to get user project ID.", status_code=500)
-    
-    onboard_user(creds, proj_id)
+        proj_id = get_user_project_id(creds)
+        if not proj_id:
+            return Response(content="Failed to get user project ID.", status_code=500)
 
-    # Build the final payload with project info
-    final_payload = {
-        "model": payload.get("model"),
-        "project": proj_id,
-        "request": payload.get("request", {})
-    }
+        onboard_user(creds, proj_id)
 
-    # Determine the action and URL
-    action = "streamGenerateContent" if is_streaming else "generateContent"
-    target_url = f"{CODE_ASSIST_ENDPOINT}/v1internal:{action}"
-    if is_streaming:
-        target_url += "?alt=sse"
+        final_payload = {
+            "model": payload.get("model"),
+            "project": proj_id,
+            "request": payload.get("request", {}),
+        }
 
-    # Build request headers
-    request_headers = {
-        "Authorization": f"Bearer {creds.token}",
-        "Content-Type": "application/json",
-        #"User-Agent": get_user_agent(),
-        "User-Agent": "google-api-nodejs-client/9.15.1",
-        "X-Goog-Api-Client": "gl-node/22.17.0",
-        "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI"
-    }
-
-    final_post_data = json.dumps(final_payload)
-
-    # Send the request
-    try:
+        action = "streamGenerateContent" if is_streaming else "generateContent"
+        target_url = f"{CODE_ASSIST_ENDPOINT}/v1internal:{action}"
         if is_streaming:
-            resp = requests.post(target_url, data=final_post_data, headers=request_headers, stream=True)
-            # Record stat based on initial HTTP status
+            target_url += "?alt=sse"
+
+        request_headers = {
+            "Authorization": f"Bearer {creds.token}",
+            "Content-Type": "application/json",
+            "User-Agent": "google-api-nodejs-client/9.15.1",
+            "X-Goog-Api-Client": "gl-node/22.17.0",
+            "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+        }
+
+        try:
+            resp = requests.post(
+                target_url,
+                data=json.dumps(final_payload),
+                headers=request_headers,
+                stream=is_streaming,
+            )
+
+            # Retry on 429 with next account
+            if resp.status_code == 429 and attempt < max_retries - 1:
+                record_usage(proj_id, False)
+                logging.warning(
+                    f"429 rate limited on project {proj_id}. "
+                    f"Retrying with next account ({attempt + 1}/{max_retries})..."
+                )
+                continue
+
             record_usage(proj_id, resp.status_code == 200)
-            return _handle_streaming_response(resp)
-        else:
-            resp = requests.post(target_url, data=final_post_data, headers=request_headers)
-            # Record stat based on initial HTTP status
-            record_usage(proj_id, resp.status_code == 200)
-            return _handle_non_streaming_response(resp)
-            
-    except requests.exceptions.RequestException as e:
-        record_usage(proj_id, False)
-        logging.error(f"Request to Google API failed: {str(e)}")
-        return Response(
-            content=json.dumps({"error": {"message": f"Request failed: {str(e)}"}}),
-            status_code=500,
-            media_type="application/json"
-        )
-    except Exception as e:
-        record_usage(proj_id, False)
-        logging.error(f"Unexpected error during Google API request: {str(e)}")
-        return Response(
-            content=json.dumps({"error": {"message": f"Unexpected error: {str(e)}"}}),
-            status_code=500,
-            media_type="application/json"
-        )
+
+            if is_streaming:
+                return _handle_streaming_response(resp)
+            else:
+                return _handle_non_streaming_response(resp)
+
+        except requests.exceptions.RequestException as e:
+            record_usage(proj_id, False)
+            if attempt < max_retries - 1:
+                logging.warning(f"Request failed: {e}. Trying next account...")
+                continue
+            return Response(
+                content=json.dumps({"error": {"message": f"Request failed: {e}"}}),
+                status_code=500,
+                media_type="application/json",
+            )
+
+    # Should never reach here, but just in case
+    return Response(
+        content=json.dumps({"error": {"message": "All accounts exhausted."}}),
+        status_code=429,
+        media_type="application/json",
+    )
 
 def _handle_streaming_response(resp) -> StreamingResponse:
     """Handle streaming response from Google API."""
