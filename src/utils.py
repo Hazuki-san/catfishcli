@@ -131,3 +131,17 @@ def apply_scorched_earth_thinking_config(
         tc["includeThoughts"] = fallback_include
         
     return generation_config
+
+def clamp_top_k(generation_config: dict) -> dict:
+    """
+    Clamp topK to the cloudcode maximum of 64.
+    Values at or below 64 are left untouched.
+    """
+    for key in ("topK", "top_k"):
+        value = generation_config.get(key)
+        if value is not None and isinstance(value, (int, float)):
+            if value > 64:
+                generation_config[key] = 64
+            else:
+                generation_config[key] = int(value)
+    return generation_config
