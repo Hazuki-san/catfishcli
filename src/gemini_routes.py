@@ -1,10 +1,9 @@
 """
-Gemini API Routes - Native Gemini API endpoints with disconnect detection.
+Gemini API Routes - Native Gemini API endpoints with async disconnect detection.
 """
 import json
 import logging
 import asyncio
-import threading
 from fastapi import APIRouter, Request, Response, Depends
 from fastapi.responses import StreamingResponse
 
@@ -15,8 +14,8 @@ from .config import SUPPORTED_MODELS
 router = APIRouter()
 
 
-async def _watch_disconnect(request: Request, event: threading.Event):
-    """Background task that sets the event when the client disconnects."""
+async def _watch_disconnect(request: Request, event: asyncio.Event):
+    """Sets the event when the client disconnects."""
     try:
         while not event.is_set():
             if await request.is_disconnected():
@@ -31,7 +30,7 @@ async def _watch_disconnect(request: Request, event: threading.Event):
 def _wrap_with_disconnect(
     response: StreamingResponse,
     request: Request,
-    disconnect_event: threading.Event,
+    disconnect_event: asyncio.Event,
 ) -> StreamingResponse:
     """Wrap a StreamingResponse with client disconnect detection."""
     original_iterator = response.body_iterator
@@ -106,15 +105,13 @@ async def gemini_proxy(request: Request, full_path: str, username: str = Depends
 
         gemini_payload = build_gemini_payload_from_native(incoming_request, model_name)
 
-        # Create disconnect event and pass it through
-        disconnect_event = threading.Event()
-        response = send_gemini_request(
+        disconnect_event = asyncio.Event()
+        response = await send_gemini_request(
             gemini_payload,
             is_streaming=is_streaming,
             disconnect_event=disconnect_event,
         )
 
-        # Wrap streaming responses with disconnect detection
         if is_streaming and isinstance(response, StreamingResponse):
             response = _wrap_with_disconnect(response, request, disconnect_event)
 

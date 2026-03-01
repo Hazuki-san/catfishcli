@@ -1,11 +1,10 @@
 """
-OpenAI API Routes - OpenAI-compatible endpoints with disconnect detection.
+OpenAI API Routes - Fully async with disconnect detection.
 """
 import json
 import uuid
 import asyncio
 import logging
-import threading
 from fastapi import APIRouter, Request, Response, Depends
 from fastapi.responses import StreamingResponse
 
@@ -21,8 +20,8 @@ from .google_api_client import send_gemini_request, build_gemini_payload_from_op
 router = APIRouter()
 
 
-async def _watch_disconnect(request: Request, event: threading.Event):
-    """Background task that sets the event when the client disconnects."""
+async def _watch_disconnect(request: Request, event: asyncio.Event):
+    """Sets the event when the client disconnects."""
     try:
         while not event.is_set():
             if await request.is_disconnected():
@@ -41,7 +40,6 @@ async def openai_chat_completions(
     username: str = Depends(authenticate_user),
 ):
     """OpenAI-compatible chat completions endpoint."""
-
     try:
         logging.info(f"OpenAI chat completion request: model={request.model}, stream={request.stream}")
         raw_body = await http_request.json()
@@ -51,7 +49,6 @@ async def openai_chat_completions(
             openai_payload=gemini_request_data,
             raw_openai_request=raw_body,
         )
-
     except Exception as e:
         logging.error(f"Error processing OpenAI request: {str(e)}")
         return Response(
@@ -62,14 +59,13 @@ async def openai_chat_completions(
             media_type="application/json",
         )
 
-    # Create disconnect event for this request
-    disconnect_event = threading.Event()
+    disconnect_event = asyncio.Event()
 
     if request.stream:
         async def openai_stream_generator():
             watcher = asyncio.create_task(_watch_disconnect(http_request, disconnect_event))
             try:
-                response = send_gemini_request(
+                response = await send_gemini_request(
                     gemini_payload,
                     is_streaming=True,
                     disconnect_event=disconnect_event,
@@ -86,6 +82,11 @@ async def openai_chat_completions(
 
                         if isinstance(chunk, bytes):
                             chunk = chunk.decode("utf-8", "ignore")
+
+                        # Forward keep-alive
+                        if chunk.startswith(": keep-alive"):
+                            yield ": keep-alive\n\n"
+                            continue
 
                         if chunk.startswith("data: "):
                             try:
@@ -109,15 +110,15 @@ async def openai_chat_completions(
                                     gemini_chunk, request.model, response_id
                                 )
                                 yield f"data: {json.dumps(openai_chunk)}\n\n"
-                                await asyncio.sleep(0)
 
                             except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
                                 logging.warning(f"Failed to parse streaming chunk: {str(e)}")
                                 continue
 
-                        elif chunk.startswith(": keep-alive"):
-                            # Forward keep-alive as SSE comment
-                            yield ": keep-alive\n\n"
+                        elif chunk.startswith("event: error"):
+                            # Forward SSE error events from upstream
+                            yield chunk
+                            continue
 
                     yield "data: [DONE]\n\n"
                     logging.info(f"Completed streaming response: {response_id}")
@@ -168,7 +169,7 @@ async def openai_chat_completions(
 
     else:
         try:
-            response = send_gemini_request(
+            response = await send_gemini_request(
                 gemini_payload,
                 is_streaming=False,
                 disconnect_event=disconnect_event,
@@ -176,7 +177,6 @@ async def openai_chat_completions(
 
             if isinstance(response, Response) and response.status_code != 200:
                 logging.error(f"Gemini API error: status={response.status_code}")
-
                 try:
                     error_body = response.body
                     if isinstance(error_body, bytes):
