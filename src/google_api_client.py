@@ -1,14 +1,14 @@
 """
-Google API Client - Handles all communication with Google's Gemini API.
-Includes retry logic, disconnect detection, keep-alive, and session management.
+Google API Client - Fully async using httpx.
+No more threading gymnastics for streaming.
 """
 import json
 import logging
 import datetime
 import threading
 import time
-import requests
 import asyncio
+import httpx
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 
@@ -17,7 +17,7 @@ from .utils import (
     get_user_agent,
     sanitize_historical_signatures,
     apply_scorched_earth_thinking_config,
-    clamp_top_k
+    clamp_top_k,
 )
 from .config import (
     CODE_ASSIST_ENDPOINT,
@@ -25,16 +25,34 @@ from .config import (
     get_base_model_name,
     is_search_model,
     get_thinking_budget,
-    should_include_thoughts
+    should_include_thoughts,
 )
 
 # --- Timeouts ---
-CONNECT_TIMEOUT = 10       # seconds to establish connection
-READ_TIMEOUT_STREAM = 300  # 5 min for streaming (long thinking models)
-READ_TIMEOUT_NORMAL = 120  # 2 min for non-streaming
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT_STREAM = 300
+READ_TIMEOUT_NORMAL = 120
+KEEPALIVE_INTERVAL = 15
 
-# --- Keep-alive interval ---
-KEEPALIVE_INTERVAL = 15  # seconds between keep-alive pings during streaming
+# --- Shared async client (connection pooling) ---
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Lazy-init a shared async client with connection pooling."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            http2=True,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30,
+            ),
+            follow_redirects=True,
+        )
+    return _http_client
+
 
 # --- Stats ---
 _stats_lock = threading.Lock()
@@ -43,7 +61,7 @@ _daily_stats = {
     "total_success": 0,
     "total_fail": 0,
     "total": 0,
-    "accounts": {}
+    "accounts": {},
 }
 
 
@@ -51,70 +69,64 @@ _daily_stats = {
 #  Public API
 # ===========================================================================
 
-def send_gemini_request(
+async def send_gemini_request(
     payload: dict,
     is_streaming: bool = False,
-    disconnect_event: threading.Event = None,
+    disconnect_event: asyncio.Event = None,
 ) -> Response:
     """
-    Send a request to Google's Gemini API with automatic retry and account rotation.
-
-    Args:
-        payload: The request payload in Gemini format.
-        is_streaming: Whether this is a streaming request.
-        disconnect_event: Optional event that signals client disconnect.
-
-    Returns:
-        FastAPI Response object.
+    Send a request to Google's Gemini API with retry and account rotation.
+    Fully async — no threads.
     """
     num_accounts = len(ACCOUNTS) if ACCOUNTS else 1
-    max_retries = num_accounts * 2  # Two full passes through all accounts
+    max_retries = num_accounts * 2
 
     for attempt in range(max_retries):
-        # Bail early if client is gone
         if disconnect_event and disconnect_event.is_set():
             logging.info("Client disconnected, aborting retry loop.")
             return _error_response("Client disconnected.", 499)
 
-        # --- Get credentials (with built-in failover) ---
-        creds = get_credentials()
+        # get_credentials is still sync (Google's auth library is sync)
+        # but it's fast enough to not matter
+        creds = await asyncio.to_thread(get_credentials)
         if not creds or not creds.token:
             return _error_response(
-                "No valid credentials available. Please check accounts and restart if needed.",
-                500,
+                "No valid credentials available.", 500
             )
 
-        proj_id = get_user_project_id(creds)
+        proj_id = await asyncio.to_thread(get_user_project_id, creds)
         if not proj_id:
             return _error_response("Failed to get user project ID.", 500)
 
-        onboard_user(creds, proj_id)
+        await asyncio.to_thread(onboard_user, creds, proj_id)
 
-        # --- Send single attempt ---
-        response = _send_single_request(
+        response = await _send_single_request(
             payload, proj_id, creds, is_streaming, disconnect_event
         )
 
-        # --- Retry on 429 ---
         status = getattr(response, "status_code", None)
         if status == 429 and attempt < max_retries - 1:
             record_usage(proj_id, False)
 
             if attempt >= num_accounts:
-                # Second pass — exponential backoff, capped at 10 s
                 delay = min(2 ** (attempt - num_accounts), 10)
                 logging.warning(
                     f"429 on project {proj_id}. "
                     f"Retry {attempt + 1}/{max_retries}, waiting {delay}s..."
                 )
-                # Interruptible sleep so we stop if client disconnects
-                for _ in range(int(delay * 10)):
-                    if disconnect_event and disconnect_event.is_set():
-                        logging.info("Client disconnected during retry backoff.")
-                        return _error_response("Client disconnected.", 499)
-                    time.sleep(0.1)
+                # Async sleep — no thread blocking, interruptible
+                try:
+                    await asyncio.wait_for(
+                        _wait_for_disconnect(disconnect_event),
+                        timeout=delay,
+                    )
+                    # If we get here, client disconnected during wait
+                    logging.info("Client disconnected during retry backoff.")
+                    return _error_response("Client disconnected.", 499)
+                except asyncio.TimeoutError:
+                    # Normal — backoff finished, continue retry
+                    pass
             else:
-                # First pass — instant switch to next account
                 logging.warning(
                     f"429 on project {proj_id}. "
                     f"Trying next account ({attempt + 1}/{max_retries})..."
@@ -126,18 +138,26 @@ def send_gemini_request(
     return _error_response("All retry attempts exhausted (429).", 429)
 
 
+async def _wait_for_disconnect(event: asyncio.Event | None):
+    """Wait until client disconnects. If no event, wait forever."""
+    if event is None:
+        await asyncio.Future()  # never resolves
+    else:
+        await event.wait()
+
+
 # ===========================================================================
-#  Single-request logic (no retry here)
+#  Single-request logic
 # ===========================================================================
 
-def _send_single_request(
+async def _send_single_request(
     payload: dict,
     proj_id: str,
     creds,
     is_streaming: bool,
-    disconnect_event: threading.Event = None,
+    disconnect_event: asyncio.Event = None,
 ) -> Response:
-    """Execute one HTTP request against the Gemini API."""
+    """Execute one HTTP request against the Gemini API. Fully async."""
 
     final_payload = {
         "model": payload.get("model"),
@@ -158,83 +178,88 @@ def _send_single_request(
         "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
     }
 
-    session = requests.Session()
+    post_data = json.dumps(final_payload)
+    client = _get_client()
 
     try:
         if is_streaming:
-            resp = session.post(
-                target_url,
-                data=json.dumps(final_payload),
-                headers=request_headers,
-                stream=True,
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT_STREAM),
+            timeout = httpx.Timeout(
+                connect=CONNECT_TIMEOUT,
+                read=READ_TIMEOUT_STREAM,
+                write=10.0,
+                pool=10.0,
             )
-            record_usage(proj_id, resp.status_code == 200)
-            return _handle_streaming_response(resp, session, disconnect_event)
-        else:
-            resp = session.post(
-                target_url,
-                data=json.dumps(final_payload),
-                headers=request_headers,
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT_NORMAL),
+            req = client.build_request(
+                "POST", target_url, content=post_data, headers=request_headers
             )
+            resp = await client.send(req, stream=True, timeout=timeout)
             record_usage(proj_id, resp.status_code == 200)
-            result = _handle_non_streaming_response(resp)
-            session.close()
-            return result
+            return _handle_streaming_response(resp, disconnect_event)
 
-    except requests.exceptions.Timeout:
+        else:
+            timeout = httpx.Timeout(
+                connect=CONNECT_TIMEOUT,
+                read=READ_TIMEOUT_NORMAL,
+                write=10.0,
+                pool=10.0,
+            )
+            resp = await client.post(
+                target_url,
+                content=post_data,
+                headers=request_headers,
+                timeout=timeout,
+            )
+            record_usage(proj_id, resp.status_code == 200)
+            return _handle_non_streaming_response(resp)
+
+    except httpx.TimeoutException:
         record_usage(proj_id, False)
-        session.close()
         logging.error(f"Request to Google API timed out for project {proj_id}")
         return _error_response("Request to Google API timed out.", 504)
 
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         record_usage(proj_id, False)
-        session.close()
-        logging.error(f"Request to Google API failed: {str(e)}")
-        return _error_response(f"Request failed: {str(e)}", 502)
+        logging.error(f"Request to Google API failed: {e}")
+        return _error_response(f"Request failed: {e}", 502)
 
     except Exception as e:
         record_usage(proj_id, False)
-        session.close()
-        logging.error(f"Unexpected error during Google API request: {str(e)}")
-        return _error_response(f"Unexpected error: {str(e)}", 500)
+        logging.error(f"Unexpected error during Google API request: {e}")
+        return _error_response(f"Unexpected error: {e}", 500)
 
 
 # ===========================================================================
-#  Streaming response handler (with keep-alive + disconnect detection)
+#  Streaming response — pure async, no threads, no queues
 # ===========================================================================
 
 def _handle_streaming_response(
-    resp,
-    session: requests.Session,
-    disconnect_event: threading.Event = None,
+    resp: httpx.Response,
+    disconnect_event: asyncio.Event = None,
 ) -> StreamingResponse:
-    """Handle streaming response with keep-alive pings and disconnect detection."""
+    """Handle streaming response. Clean async iteration."""
 
-    # --- HTTP error before streaming starts ---
     if resp.status_code != 200:
-        logging.error(f"Google API returned status {resp.status_code}: {resp.text}")
         error_message = f"Google API error: {resp.status_code}"
         try:
-            error_data = resp.json()
+            body = resp.read()  # httpx sync read for error body
+            error_data = json.loads(body)
             if "error" in error_data:
                 error_message = error_data["error"].get("message", error_message)
         except Exception:
             pass
 
-        session.close()
-
         async def error_generator():
-            error_response = {
+            await resp.aclose()
+            error_body = {
                 "error": {
                     "message": error_message,
                     "type": "invalid_request_error" if resp.status_code == 404 else "api_error",
                     "code": resp.status_code,
                 }
             }
-            yield f"event: error\ndata: {json.dumps(error_response)}\n\n".encode("utf-8")
+            yield f"event: error\ndata: {json.dumps(error_body)}\n\n".encode("utf-8")
+
+        logging.error(f"Google API returned status {resp.status_code}: {error_message}")
 
         return StreamingResponse(
             error_generator(),
@@ -243,90 +268,44 @@ def _handle_streaming_response(
             status_code=resp.status_code,
         )
 
-    # --- Success: stream with keep-alive via background thread + asyncio.Queue ---
     async def stream_generator():
-        loop = asyncio.get_event_loop()
-        chunk_queue: asyncio.Queue = asyncio.Queue()
-
-        def _read_upstream():
-            """Runs in a daemon thread — reads from Google and puts chunks into the queue."""
-            try:
-                with resp:
-                    for line in resp.iter_lines():
-                        if disconnect_event and disconnect_event.is_set():
-                            break
-                        if line:
-                            loop.call_soon_threadsafe(chunk_queue.put_nowait, line)
-                # Sentinel: stream finished normally
-                loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
-            except Exception as e:
-                loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
-            finally:
-                session.close()
-
-        reader = threading.Thread(target=_read_upstream, daemon=True)
-        reader.start()
+        last_data_time = asyncio.get_event_loop().time()
 
         try:
-            while True:
+            async for line in resp.aiter_lines():
                 # Check disconnect
                 if disconnect_event and disconnect_event.is_set():
                     logging.info("Client disconnected, stopping stream.")
                     break
 
-                try:
-                    item = await asyncio.wait_for(
-                        chunk_queue.get(), timeout=KEEPALIVE_INTERVAL
-                    )
-                except asyncio.TimeoutError:
-                    # No data for KEEPALIVE_INTERVAL seconds — send keep-alive comment
-                    yield ": keep-alive\n\n".encode("utf-8")
+                if not line:
+                    # Empty line — check if we need keep-alive
+                    now = asyncio.get_event_loop().time()
+                    if now - last_data_time > KEEPALIVE_INTERVAL:
+                        yield ": keep-alive\n\n".encode("utf-8")
+                        last_data_time = now
                     continue
 
-                # Sentinel — upstream finished
-                if item is None:
-                    break
+                last_data_time = asyncio.get_event_loop().time()
 
-                # Exception from reader thread
-                if isinstance(item, Exception):
-                    logging.error(f"Upstream read error: {item}")
-                    error_body = {
-                        "error": {
-                            "message": f"Upstream error: {item}",
-                            "type": "api_error",
-                            "code": 502,
-                        }
-                    }
-                    yield f"event: error\ndata: {json.dumps(error_body)}\n\n".encode(
-                        "utf-8"
-                    )
-                    break
-
-                # Normal chunk processing
-                if not isinstance(item, str):
-                    item = item.decode("utf-8", "ignore")
-
-                if item.startswith("data: "):
-                    item = item[len("data: "):]
+                if line.startswith("data: "):
+                    line = line[len("data: "):]
 
                     try:
-                        obj = json.loads(item)
+                        obj = json.loads(line)
 
                         if "response" in obj:
                             response_chunk = obj["response"]
-                            response_json = json.dumps(
-                                response_chunk, separators=(",", ":")
-                            )
-                            yield f"data: {response_json}\n\n".encode("utf-8", "ignore")
+                            response_json = json.dumps(response_chunk, separators=(",", ":"))
+                            yield f"data: {response_json}\n\n".encode("utf-8")
                         else:
-                            yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode(
-                                "utf-8", "ignore"
-                            )
+                            yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode("utf-8")
 
-                        await asyncio.sleep(0)
                     except json.JSONDecodeError:
                         continue
 
+        except httpx.StreamClosed:
+            logging.info("Upstream stream closed.")
         except asyncio.CancelledError:
             logging.info("Stream generator cancelled.")
         except Exception as e:
@@ -339,6 +318,8 @@ def _handle_streaming_response(
                 }
             }
             yield f"event: error\ndata: {json.dumps(error_body)}\n\n".encode("utf-8")
+        finally:
+            await resp.aclose()
 
     return StreamingResponse(
         stream_generator(),
@@ -348,50 +329,44 @@ def _handle_streaming_response(
 
 
 # ===========================================================================
-#  Non-streaming response handler
+#  Non-streaming response
 # ===========================================================================
 
-def _handle_non_streaming_response(resp) -> Response:
-    """Handle non-streaming response from Google API."""
+def _handle_non_streaming_response(resp: httpx.Response) -> Response:
+    """Handle non-streaming response."""
     if resp.status_code == 200:
         try:
-            google_api_response = resp.text
-            if google_api_response.startswith("data: "):
-                google_api_response = google_api_response[len("data: "):]
-            google_api_response = json.loads(google_api_response)
-            standard_gemini_response = google_api_response.get("response")
+            text = resp.text
+            if text.startswith("data: "):
+                text = text[len("data: "):]
+            parsed = json.loads(text)
+            standard_response = parsed.get("response")
             return Response(
-                content=json.dumps(standard_gemini_response),
+                content=json.dumps(standard_response),
                 status_code=200,
                 media_type="application/json; charset=utf-8",
             )
         except (json.JSONDecodeError, AttributeError) as e:
-            logging.error(f"Failed to parse Google API response: {str(e)}")
+            logging.error(f"Failed to parse Google API response: {e}")
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
-                media_type=resp.headers.get("Content-Type"),
+                media_type=resp.headers.get("content-type"),
             )
     else:
         logging.error(f"Google API returned status {resp.status_code}: {resp.text}")
-
         try:
             error_data = resp.json()
             if "error" in error_data:
-                error_message = error_data["error"].get(
-                    "message", f"API error: {resp.status_code}"
-                )
-                error_response = {
-                    "error": {
-                        "message": error_message,
-                        "type": "invalid_request_error"
-                        if resp.status_code == 404
-                        else "api_error",
-                        "code": resp.status_code,
-                    }
-                }
+                error_message = error_data["error"].get("message", f"API error: {resp.status_code}")
                 return Response(
-                    content=json.dumps(error_response),
+                    content=json.dumps({
+                        "error": {
+                            "message": error_message,
+                            "type": "invalid_request_error" if resp.status_code == 404 else "api_error",
+                            "code": resp.status_code,
+                        }
+                    }),
                     status_code=resp.status_code,
                     media_type="application/json",
                 )
@@ -401,7 +376,7 @@ def _handle_non_streaming_response(resp) -> Response:
         return Response(
             content=resp.content,
             status_code=resp.status_code,
-            media_type=resp.headers.get("Content-Type"),
+            media_type=resp.headers.get("content-type"),
         )
 
 
@@ -441,7 +416,6 @@ def build_gemini_payload_from_openai(openai_payload: dict, raw_openai_request: d
 
     request_data = {k: v for k, v in request_data.items() if v is not None}
 
-    # Clamp topK
     if "generationConfig" in request_data:
         request_data["generationConfig"] = clamp_top_k(request_data["generationConfig"])
 
@@ -459,9 +433,7 @@ def build_gemini_payload_from_native(native_request: dict, model_from_path: str)
         native_request["generationConfig"] = {}
 
     if "contents" in native_request:
-        native_request["contents"] = sanitize_historical_signatures(
-            native_request["contents"]
-        )
+        native_request["contents"] = sanitize_historical_signatures(native_request["contents"])
 
     if "gemini-2.5-flash-image" not in model_from_path:
         thinking_budget = get_thinking_budget(model_from_path)
@@ -479,7 +451,6 @@ def build_gemini_payload_from_native(native_request: dict, model_from_path: str)
         if not any(tool.get("googleSearch") for tool in native_request["tools"]):
             native_request["tools"].append({"googleSearch": {}})
 
-    # Clamp topK
     native_request["generationConfig"] = clamp_top_k(native_request["generationConfig"])
 
     return {
@@ -499,7 +470,7 @@ def _sse_headers() -> dict:
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
         "Content-Disposition": "attachment",
-        "X-Accel-Buffering": "no",  # Disable nginx buffering
+        "X-Accel-Buffering": "no",
         "Vary": "Origin, X-Origin, Referer",
         "X-XSS-Protection": "0",
         "X-Frame-Options": "SAMEORIGIN",

@@ -407,6 +407,13 @@ async def health_check():
     """Health check endpoint for container orchestration."""
     return {"status": "healthy", "service": "geminicli2api"}
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up the shared httpx client."""
+    from .google_api_client import _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        logging.info("Shared httpx client closed.")
 
 app.include_router(openai_router)
 app.include_router(gemini_router)
