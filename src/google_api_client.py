@@ -18,6 +18,9 @@ from .utils import (
     sanitize_historical_signatures,
     apply_scorched_earth_thinking_config,
     clamp_top_k,
+    scrub_headers,
+    parse_retry_delay,
+    get_model_fallback_order,
     GEMINI_API_CLIENT_HEADER
 )
 from .config import (
@@ -81,8 +84,8 @@ async def send_gemini_request(
     disconnect_event: asyncio.Event = None,
 ) -> Response:
     """
-    Send a request to Google's Gemini API with retry and account rotation.
-    Fully async — no threads.
+    Send a request to Google's Gemini API with retry, account rotation,
+    and parsed retry delays from 429 responses.
     """
     num_accounts = len(ACCOUNTS) if ACCOUNTS else 1
     max_retries = num_accounts * 2
@@ -92,13 +95,9 @@ async def send_gemini_request(
             logging.info("Client disconnected, aborting retry loop.")
             return _error_response("Client disconnected.", 499)
 
-        # get_credentials is still sync (Google's auth library is sync)
-        # but it's fast enough to not matter
         creds = await asyncio.to_thread(get_credentials)
         if not creds or not creds.token:
-            return _error_response(
-                "No valid credentials available.", 500
-            )
+            return _error_response("No valid credentials available.", 500)
 
         proj_id = await asyncio.to_thread(get_user_project_id, creds)
         if not proj_id:
@@ -114,35 +113,56 @@ async def send_gemini_request(
         if status == 429 and attempt < max_retries - 1:
             record_usage(proj_id, False)
 
-            if attempt >= num_accounts:
+            # Try to parse Google's retry delay from the response body
+            delay = None
+            try:
+                body = getattr(response, "body", None)
+                if body:
+                    if isinstance(body, bytes):
+                        body = body.decode("utf-8", "ignore")
+                    delay = parse_retry_delay(body)
+            except Exception:
+                pass
+
+            if delay is not None and delay > 0:
+                # Use Google's suggested delay, but cap at 30s
+                delay = min(delay, 30.0)
+                logging.warning(
+                    f"429 on project {proj_id}. "
+                    f"Google says retry after {delay:.2f}s. "
+                    f"Retry {attempt + 1}/{max_retries}..."
+                )
+            elif attempt >= num_accounts:
+                # Second pass
                 delay = min(2 ** (attempt - num_accounts), 10)
                 logging.warning(
                     f"429 on project {proj_id}. "
-                    f"Retry {attempt + 1}/{max_retries}, waiting {delay}s..."
+                    f"Retry {attempt + 1}/{max_retries}, backoff {delay}s..."
                 )
-                # Async sleep — no thread blocking, interruptible
+            else:
+                # First pass
+                delay = 0
+                logging.warning(
+                    f"429 on project {proj_id}. "
+                    f"Trying next account ({attempt + 1}/{max_retries})..."
+                )
+
+            if delay and delay > 0:
                 try:
                     await asyncio.wait_for(
                         _wait_for_disconnect(disconnect_event),
                         timeout=delay,
                     )
-                    # If we get here, client disconnected during wait
                     logging.info("Client disconnected during retry backoff.")
                     return _error_response("Client disconnected.", 499)
                 except asyncio.TimeoutError:
-                    # Normal — backoff finished, continue retry
                     pass
-            else:
-                logging.warning(
-                    f"429 on project {proj_id}. "
-                    f"Trying next account ({attempt + 1}/{max_retries})..."
-                )
+
             continue
 
         return response
 
     return _error_response("All retry attempts exhausted (429).", 429)
-
 
 async def _wait_for_disconnect(event: asyncio.Event | None):
     """Wait until client disconnects. If no event, wait forever."""
@@ -176,7 +196,6 @@ async def _send_single_request(
     if is_streaming:
         target_url += "?alt=sse"
 
-    # Extract model name for the User-Agent
     model_name = payload.get("model", "unknown")
 
     request_headers = {
@@ -185,6 +204,7 @@ async def _send_single_request(
         "User-Agent": get_user_agent(model_name),
         "X-Goog-Api-Client": GEMINI_API_CLIENT_HEADER,
         "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+        "Accept": "text/event-stream" if is_streaming else "application/json",
     }
 
     post_data = json.dumps(final_payload)
@@ -202,7 +222,7 @@ async def _send_single_request(
         else:
             non_stream_timeout = httpx.Timeout(
                 connect=CONNECT_TIMEOUT,
-                read=READ_TIMEOUT_NORMAL,   # 120s
+                read=READ_TIMEOUT_NORMAL,
                 write=10.0,
                 pool=10.0,
             )

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request, Response, Depends
 from fastapi.responses import StreamingResponse
 
 from .auth import authenticate_user
+from .utils import scrub_headers
 from .google_api_client import send_gemini_request, build_gemini_payload_from_native
 from .config import SUPPORTED_MODELS
 
@@ -80,6 +81,10 @@ async def gemini_proxy(request: Request, full_path: str, username: str = Depends
     """Native Gemini API proxy endpoint with disconnect detection."""
     try:
         post_data = await request.body()
+
+        incoming_headers = scrub_headers(dict(request.headers))
+        _ = incoming_headers
+
         is_streaming = "stream" in full_path.lower()
         model_name = _extract_model_from_path(full_path)
 

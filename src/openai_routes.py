@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request, Response, Depends
 from fastapi.responses import StreamingResponse
 
 from .auth import authenticate_user
+from .utils import scrub_headers
 from .models import OpenAIChatCompletionRequest
 from .openai_transformers import (
     openai_request_to_gemini,
@@ -42,6 +43,8 @@ async def openai_chat_completions(
     """OpenAI-compatible chat completions endpoint."""
     try:
         logging.info(f"OpenAI chat completion request: model={request.model}, stream={request.stream}")
+        _ = scrub_headers(dict(http_request.headers))
+
         raw_body = await http_request.json()
 
         gemini_request_data = openai_request_to_gemini(request)

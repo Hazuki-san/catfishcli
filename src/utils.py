@@ -1,3 +1,5 @@
+import json
+import re
 import platform
 from .config import CLI_VERSION
 
@@ -150,3 +152,152 @@ def clamp_top_k(generation_config: dict) -> dict:
             else:
                 generation_config[key] = int(value)
     return generation_config
+
+# Headers to scrub from incoming requests before forwarding upstream.
+# Prevents leaking proxy infrastructure, client identity, and browser fingerprints.
+SCRUB_HEADERS = [
+    # Proxy tracing
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+    "forwarded",
+    "via",
+    # Client identity (OpenAI SDK fingerprints)
+    "x-title",
+    "x-stainless-lang",
+    "x-stainless-package-version",
+    "x-stainless-os",
+    "x-stainless-arch",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "http-referer",
+    "referer",
+    # Browser / Electron fingerprints
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "sec-fetch-dest",
+    "priority",
+    # Encoding negotiation (zstd is an Electron fingerprint)
+    "accept-encoding",
+]
+
+
+def scrub_headers(headers: dict) -> dict:
+    """
+    Remove proxy, fingerprint, and identity headers from a dict.
+    Returns a clean copy safe to forward upstream.
+    """
+    if not headers:
+        return headers
+    lowered_scrub = set(SCRUB_HEADERS)
+    return {k: v for k, v in headers.items() if k.lower() not in lowered_scrub}
+
+
+def parse_retry_delay(error_body: bytes | str) -> float | None:
+    """
+    Extract the retry delay from a Google API 429 error response.
+
+    Checks (in order):
+      1. error.details[].retryDelay  (RetryInfo)
+      2. error.details[].metadata.quotaResetDelay (ErrorInfo)
+      3. "Your quota will reset after Xs." in error.message
+
+    Returns delay in seconds, or None if not found.
+    """
+    try:
+        if isinstance(error_body, bytes):
+            error_body = error_body.decode("utf-8", "ignore")
+
+        data = json.loads(error_body) if isinstance(error_body, str) else error_body
+        error_obj = data if "error" not in data else data["error"]
+
+        # If the top-level is a list (Google sometimes wraps errors in arrays)
+        if isinstance(data, list) and len(data) > 0:
+            error_obj = data[0].get("error", data[0])
+
+        details = error_obj.get("details", [])
+
+        # Priority 1: RetryInfo.retryDelay (e.g. "0.847655010s")
+        for detail in details:
+            if detail.get("@type", "").endswith("RetryInfo"):
+                delay_str = detail.get("retryDelay", "")
+                if delay_str:
+                    parsed = _parse_duration_string(delay_str)
+                    if parsed is not None:
+                        return parsed
+
+        # Priority 2: ErrorInfo.metadata.quotaResetDelay (e.g. "373.801628ms")
+        for detail in details:
+            if detail.get("@type", "").endswith("ErrorInfo"):
+                quota_delay = detail.get("metadata", {}).get("quotaResetDelay", "")
+                if quota_delay:
+                    parsed = _parse_duration_string(quota_delay)
+                    if parsed is not None:
+                        return parsed
+
+        # Priority 3: Parse from error.message "Your quota will reset after Xs."
+        message = error_obj.get("message", "")
+        if message:
+            match = re.search(r"after\s+(\d+)s\.?", message)
+            if match:
+                return float(match.group(1))
+
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+        pass
+
+    return None
+
+
+def _parse_duration_string(s: str) -> float | None:
+    s = s.strip()
+    if not s:
+        return None
+
+    try:
+        if s.endswith("ms"):
+            return float(s[:-2]) / 1000.0
+        elif s.endswith("us") or s.endswith("µs"):
+            return float(s[:-2]) / 1_000_000.0
+        elif s.endswith("ns"):
+            return float(s[:-2]) / 1_000_000_000.0
+        elif s.endswith("s"):
+            return float(s[:-1])
+        else:
+            # Try as raw seconds
+            return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+# Model fallback candidates for 429 retry.
+MODEL_FALLBACK_ORDER = {
+    "gemini-2.5-pro": [
+        # "gemini-2.5-pro-preview-05-06",
+        # "gemini-2.5-pro-preview-06-05",
+    ],
+    "gemini-2.5-flash": [
+        # "gemini-2.5-flash-preview-04-17",
+        # "gemini-2.5-flash-preview-05-20",
+    ],
+    "gemini-2.5-flash-lite": [
+        # "gemini-2.5-flash-lite-preview-06-17",
+    ],
+}
+
+
+def get_model_fallback_order(model: str) -> list[str]:
+    """
+    Returns list of models to try, starting with the requested model.
+    Falls back to preview variants on 429.
+    """
+    candidates = MODEL_FALLBACK_ORDER.get(model, [])
+    result = [model]
+    for c in candidates:
+        if c != model:
+            result.append(c)
+    return result
