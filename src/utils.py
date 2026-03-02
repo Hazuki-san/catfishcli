@@ -2,20 +2,38 @@ import platform
 from .config import CLI_VERSION
 
 GEMINI_DUMMY_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
+GEMINI_API_CLIENT_HEADER = "google-genai-sdk/1.41.0 gl-node/v22.19.0"
 
-def get_user_agent():
+def _get_nodejs_os():
+    """Map Python platform to Node.js-style OS string."""
+    system = platform.system().lower()
+    if system == "windows":
+        return "win32"
+    return system  # "linux", "darwin" already match
+
+
+def _get_nodejs_arch():
+    """Map Python arch to Node.js-style arch string."""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return "x64"
+    elif machine in ("i386", "i686", "x86"):
+        return "x86"
+    elif machine in ("arm64", "aarch64"):
+        return "arm64"
+    return machine
+
+
+def get_user_agent(model: str = "unknown"):
     """Generate User-Agent string matching gemini-cli format."""
-    version = CLI_VERSION
-    system = platform.system()
-    arch = platform.machine()
-    return f"GeminiCLI/{version} ({system}; {arch})"
+    return f"GeminiCLI/{CLI_VERSION}/{model} ({_get_nodejs_os()}; {_get_nodejs_arch()})"
+
 
 def get_platform_string():
     """Generate platform string matching gemini-cli format."""
     system = platform.system().upper()
     arch = platform.machine().upper()
-    
-    # Map to gemini-cli platform format
+
     if system == "DARWIN":
         if arch in ["ARM64", "AARCH64"]:
             return "DARWIN_ARM64"
@@ -31,6 +49,7 @@ def get_platform_string():
     else:
         return "PLATFORM_UNSPECIFIED"
 
+
 def get_client_metadata(project_id=None):
     return {
         "ideType": "IDE_UNSPECIFIED",
@@ -39,31 +58,29 @@ def get_client_metadata(project_id=None):
         "duetProject": project_id,
     }
 
+
 def sanitize_historical_signatures(contents: list) -> list:
     """
-    Recursively injects a dummy thought signature into parts that typically 
-    cause validation errors when passing historical messages back to Gemini 
-    (like function calls, thoughts, and inline images).
+    Recursively injects a dummy thought signature into parts that typically
+    cause validation errors when passing historical messages back to Gemini.
     """
     if not contents:
         return contents
-        
+
     for message in contents:
         parts = message.get("parts", [])
         for part in parts:
-            # If the part is a tool call, reasoning thought, or inline image data,
-            # it technically requires a cryptographic signature from the model. 
-            # We bypass this for historical messages to avoid 400 errors.
             needs_signature = any(key in part for key in ["functionCall", "thought", "inlineData"])
-            
+
             if needs_signature and "thoughtSignature" not in part:
                 part["thoughtSignature"] = GEMINI_DUMMY_THOUGHT_SIGNATURE
-                
+
     return contents
 
+
 def apply_scorched_earth_thinking_config(
-    generation_config: dict, 
-    fallback_budget: int = None, 
+    generation_config: dict,
+    fallback_budget: int = None,
     fallback_include: bool = True,
     openai_reasoning_effort: str = None
 ) -> dict:
@@ -73,64 +90,52 @@ def apply_scorched_earth_thinking_config(
     """
     if "thinkingConfig" not in generation_config:
         generation_config["thinkingConfig"] = {}
-        
+
     tc = generation_config["thinkingConfig"]
-    
-    # 1. Clean up snake_case include_thoughts immediately
+
     if "include_thoughts" in tc:
         tc["includeThoughts"] = tc.pop("include_thoughts")
-        
-    # 2. CASE: Translating an OpenAI 'reasoning_effort' parameter
+
     if openai_reasoning_effort:
         effort = str(openai_reasoning_effort).lower().strip()
-        
-        # Scorched earth: wipe all existing budget/level keys to start fresh
+
         tc.pop("thinkingLevel", None)
         tc.pop("thinking_level", None)
         tc.pop("thinkingBudget", None)
         tc.pop("thinking_budget", None)
-        
+
         if effort == "auto":
-            # Auto defaults to budget mode with -1
             tc["thinkingBudget"] = -1
             tc["includeThoughts"] = True
         elif effort in ["low", "medium", "high"]:
-            # Low/Med/High maps to thinkingLevel
             tc["thinkingLevel"] = effort.upper()
             tc["includeThoughts"] = True
         elif effort == "none":
             tc["includeThoughts"] = False
-            
-    # 3. CASE: Native Gemini request validation
     else:
         has_level = "thinkingLevel" in tc or "thinking_level" in tc
         has_budget = "thinkingBudget" in tc or "thinking_budget" in tc
-        
+
         if has_level:
-            # If level exists, destroy all traces of budget
             tc.pop("thinkingBudget", None)
             tc.pop("thinking_budget", None)
-            # Ensure proper casing
             if "thinking_level" in tc:
                 tc["thinkingLevel"] = tc.pop("thinking_level")
         elif has_budget:
-            # If budget exists, destroy all traces of level
             tc.pop("thinkingLevel", None)
             tc.pop("thinking_level", None)
-            # Ensure proper casing
             if "thinking_budget" in tc:
                 tc["thinkingBudget"] = tc.pop("thinking_budget")
         elif fallback_budget is not None:
-            # If neither exists, safely apply the fallback budget
             tc["thinkingBudget"] = fallback_budget
             tc.pop("thinkingLevel", None)
             tc.pop("thinking_level", None)
 
-    # 4. Standardize 'includeThoughts' fallback if it's completely missing
     if "includeThoughts" not in tc:
         tc["includeThoughts"] = fallback_include
-        
+
     return generation_config
+
 
 def clamp_top_k(generation_config: dict) -> dict:
     """

@@ -18,6 +18,7 @@ from .utils import (
     sanitize_historical_signatures,
     apply_scorched_earth_thinking_config,
     clamp_top_k,
+    GEMINI_API_CLIENT_HEADER
 )
 from .config import (
     CODE_ASSIST_ENDPOINT,
@@ -44,6 +45,12 @@ def _get_client() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
             http2=True,
+            timeout=httpx.Timeout(
+                connect=CONNECT_TIMEOUT,
+                read=READ_TIMEOUT_STREAM,
+                write=10.0,
+                pool=10.0,
+            ),
             limits=httpx.Limits(
                 max_connections=100,
                 max_keepalive_connections=20,
@@ -52,7 +59,6 @@ def _get_client() -> httpx.AsyncClient:
             follow_redirects=True,
         )
     return _http_client
-
 
 # --- Stats ---
 _stats_lock = threading.Lock()
@@ -170,11 +176,14 @@ async def _send_single_request(
     if is_streaming:
         target_url += "?alt=sse"
 
+    # Extract model name for the User-Agent
+    model_name = payload.get("model", "unknown")
+
     request_headers = {
         "Authorization": f"Bearer {creds.token}",
         "Content-Type": "application/json",
-        "User-Agent": "google-api-nodejs-client/9.15.1",
-        "X-Goog-Api-Client": "gl-node/22.17.0",
+        "User-Agent": get_user_agent(model_name),
+        "X-Goog-Api-Client": GEMINI_API_CLIENT_HEADER,
         "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
     }
 
@@ -183,23 +192,17 @@ async def _send_single_request(
 
     try:
         if is_streaming:
-            timeout = httpx.Timeout(
-                connect=CONNECT_TIMEOUT,
-                read=READ_TIMEOUT_STREAM,
-                write=10.0,
-                pool=10.0,
-            )
             req = client.build_request(
                 "POST", target_url, content=post_data, headers=request_headers
             )
-            resp = await client.send(req, stream=True, timeout=timeout)
+            resp = await client.send(req, stream=True)
             record_usage(proj_id, resp.status_code == 200)
             return _handle_streaming_response(resp, disconnect_event)
 
         else:
-            timeout = httpx.Timeout(
+            non_stream_timeout = httpx.Timeout(
                 connect=CONNECT_TIMEOUT,
-                read=READ_TIMEOUT_NORMAL,
+                read=READ_TIMEOUT_NORMAL,   # 120s
                 write=10.0,
                 pool=10.0,
             )
@@ -207,7 +210,7 @@ async def _send_single_request(
                 target_url,
                 content=post_data,
                 headers=request_headers,
-                timeout=timeout,
+                timeout=non_stream_timeout,
             )
             record_usage(proj_id, resp.status_code == 200)
             return _handle_non_streaming_response(resp)

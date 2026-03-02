@@ -4,6 +4,8 @@ import base64
 import time
 import logging
 import threading
+import httpx
+
 from datetime import datetime, timezone
 
 from fastapi import Request, HTTPException, Depends
@@ -262,14 +264,13 @@ def get_user_project_id(creds):
     # Fallback: API discovery
     logging.warning("No project_id found in account data, attempting API discovery.")
     try:
-        import requests as req
         headers = {
             "Authorization": f"Bearer {creds.token}",
             "Content-Type": "application/json",
             "User-Agent": get_user_agent(),
         }
         probe_payload = {"metadata": get_client_metadata()}
-        resp = req.post(
+        resp = httpx.post(
             f"{CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist",
             data=json.dumps(probe_payload),
             headers=headers,
@@ -306,8 +307,7 @@ def onboard_user(creds, project_id):
     }
 
     try:
-        import requests as req
-        resp = req.post(
+        resp = httpx.post(
             f"{CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist",
             data=json.dumps(load_assist_payload),
             headers=headers,
@@ -334,7 +334,7 @@ def onboard_user(creds, project_id):
             "metadata": get_client_metadata(project_id),
         }
 
-        onboard_resp = req.post(
+        onboard_resp = httpx.post(
             f"{CODE_ASSIST_ENDPOINT}/v1internal:onboardUser",
             data=json.dumps(onboard_req_payload),
             headers=headers,
