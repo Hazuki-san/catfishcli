@@ -35,7 +35,7 @@ from .config import (
 # --- Timeouts ---
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT_STREAM = 300
-READ_TIMEOUT_NORMAL = 120
+READ_TIMEOUT_NORMAL = 300
 KEEPALIVE_INTERVAL = 15
 
 # --- Shared async client (connection pooling) ---
@@ -43,11 +43,10 @@ _http_client: httpx.AsyncClient | None = None
 
 
 def _get_client() -> httpx.AsyncClient:
-    """Lazy-init a shared async client with connection pooling."""
     global _http_client
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
-            http2=True,
+            http2=False,
             timeout=httpx.Timeout(
                 connect=CONNECT_TIMEOUT,
                 read=READ_TIMEOUT_STREAM,
@@ -73,6 +72,219 @@ _daily_stats = {
     "accounts": {},
 }
 
+# ===========================================================================
+#  Helpers
+# ===========================================================================
+
+def _error_response_from_google(status_code: int, raw_body: str) -> Response:
+    """Build error response preserving Google's original details for retry logic."""
+    error_message = f"Google API error: {status_code}"
+    error_reason = None
+    error_details = None
+
+    try:
+        parsed = json.loads(raw_body)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            parsed = parsed[0]
+        if "error" in parsed:
+            error_obj = parsed["error"]
+            error_message = error_obj.get("message", error_message)
+            error_details = error_obj.get("details")
+            for detail in error_obj.get("details", []):
+                if detail.get("@type", "").endswith("ErrorInfo"):
+                    error_reason = detail.get("reason")
+    except (json.JSONDecodeError, KeyError, TypeError):
+        if raw_body:
+            error_message = raw_body[:500]
+
+    body = {
+        "error": {
+            "message": error_message,
+            "type": "invalid_request_error" if status_code == 400 else "api_error",
+            "code": status_code,
+        }
+    }
+    if error_reason:
+        body["error"]["reason"] = error_reason
+    if error_details:
+        body["error"]["details"] = error_details
+
+    return Response(
+        content=json.dumps(body),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+def _extract_error_reason(body: str) -> str | None:
+    """
+    Extract the error reason from Google API or wrapper error response.
+    Checks both original Google format and our preserved format.
+    """
+    try:
+        data = json.loads(body)
+
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+
+        error_obj = data.get("error", data)
+
+        # Direct reason field (our wrapper preserves this)
+        if error_obj.get("reason"):
+            return error_obj["reason"]
+
+        # Details array (original Google format or preserved)
+        details = error_obj.get("details", [])
+        for detail in details:
+            if detail.get("@type", "").endswith("ErrorInfo"):
+                reason = detail.get("reason")
+                if reason:
+                    return reason
+
+        return error_obj.get("status")
+
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+        return None
+
+async def _check_account_quota(creds, proj_id: str, model: str) -> float | None:
+    """
+    Check remaining quota for an account before sending a request.
+    Returns remainingFraction (0.0 to 1.0) or None if check fails.
+    """
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json",
+        "User-Agent": get_user_agent(model),
+    }
+
+    try:
+        client = _get_client()
+        resp = await client.post(
+            f"{CODE_ASSIST_ENDPOINT}/v1internal:retrieveUserQuota",
+            json={"project": proj_id},
+            headers=headers,
+            timeout=5,
+        )
+
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        lowest = 1.0
+        for bucket in data.get("quotaBuckets", data.get("quotas", [])):
+            model_id = bucket.get("modelId", "")
+            fraction = bucket.get("remainingFraction")
+
+            if fraction is not None and (not model_id or model in model_id):
+                lowest = min(lowest, float(fraction))
+
+        return lowest
+
+    except Exception:
+        return None
+
+async def _get_best_account(model: str):
+    """
+    Pick the account with the highest remaining quota.
+    Falls back to round-robin if quota check fails for all accounts.
+    """
+    if not ACCOUNTS or len(ACCOUNTS) <= 1:
+        creds = await asyncio.to_thread(get_credentials)
+        if not creds or not creds.token:
+            return None, None
+        proj_id = await asyncio.to_thread(get_user_project_id, creds)
+        return creds, proj_id
+
+    best_creds = None
+    best_proj = None
+    best_quota = -1.0
+
+    for _ in range(len(ACCOUNTS)):
+        creds = await asyncio.to_thread(get_credentials)
+        if not creds or not creds.token:
+            continue
+
+        proj_id = await asyncio.to_thread(get_user_project_id, creds)
+        if not proj_id:
+            continue
+
+        quota = await _check_account_quota(creds, proj_id, model)
+
+        if quota is None:
+            # Quota check failed — save as fallback only
+            if best_creds is None:
+                best_creds = creds
+                best_proj = proj_id
+            continue
+
+        if quota > best_quota:
+            best_quota = quota
+            best_creds = creds
+            best_proj = proj_id
+
+        # >50% remaining? Good enough, stop checking
+        if quota > 0.5:
+            break
+
+    if best_creds:
+        if best_quota >= 0:
+            logging.info(
+                f"Selected account {best_proj} "
+                f"(quota: {best_quota*100:.0f}% remaining)"
+            )
+        else:
+            logging.info(f"Selected account {best_proj} (quota check unavailable)")
+        return best_creds, best_proj
+
+    return None, None
+
+def _sse_headers() -> dict:
+    """Standard SSE response headers."""
+    return {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Disposition": "attachment",
+        "X-Accel-Buffering": "no",
+        "Vary": "Origin, X-Origin, Referer",
+        "X-XSS-Protection": "0",
+        "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff",
+        "Server": "ESF",
+    }
+
+
+def _error_response(message: str, status_code: int) -> Response:
+    """Build a JSON error response."""
+    return Response(
+        content=json.dumps({"error": {"message": message, "code": status_code}}),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+def _handle_non_streaming_response_sync(resp) -> Response:
+    """Handle sync requests.Response for non-streaming."""
+    if resp.status_code == 200:
+        try:
+            text = resp.text.strip()
+            if text.startswith("data: "):
+                text = text[len("data: "):]
+            parsed = json.loads(text)
+            standard_response = parsed.get("response", parsed)
+            return Response(
+                content=json.dumps(standard_response),
+                status_code=200,
+                media_type="application/json; charset=utf-8",
+            )
+        except (json.JSONDecodeError, AttributeError) as e:
+            logging.error(f"Failed to parse Google API response: {e}")
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("Content-Type"),
+            )
+    else:
+        logging.error(f"Google API returned status {resp.status_code}: {resp.text}")
+        return _error_response_from_google(resp.status_code, resp.text)
 
 # ===========================================================================
 #  Public API
@@ -84,24 +296,39 @@ async def send_gemini_request(
     disconnect_event: asyncio.Event = None,
 ) -> Response:
     """
-    Send a request to Google's Gemini API with retry, account rotation,
-    and parsed retry delays from 429 responses.
+    Send a request to Google's Gemini API with quota-aware account selection,
+    retry, and account rotation on failure.
     """
     num_accounts = len(ACCOUNTS) if ACCOUNTS else 1
     max_retries = num_accounts * 2
+
+    RETRYABLE = {429, 502, 503, 504}
+
+    model_name = payload.get("model", "unknown")
+
+    # First attempt: use quota-aware selection
+    first_attempt = True
 
     for attempt in range(max_retries):
         if disconnect_event and disconnect_event.is_set():
             logging.info("Client disconnected, aborting retry loop.")
             return _error_response("Client disconnected.", 499)
 
-        creds = await asyncio.to_thread(get_credentials)
-        if not creds or not creds.token:
-            return _error_response("No valid credentials available.", 500)
+        if first_attempt and num_accounts > 1:
+            # Smart selection on first try
+            creds, proj_id = await _get_best_account(model_name)
+            first_attempt = False
+            if not creds or not proj_id:
+                return _error_response("No valid credentials available.", 500)
+        else:
+            # Retries use round-robin rotation
+            creds = await asyncio.to_thread(get_credentials)
+            if not creds or not creds.token:
+                return _error_response("No valid credentials available.", 500)
 
-        proj_id = await asyncio.to_thread(get_user_project_id, creds)
-        if not proj_id:
-            return _error_response("Failed to get user project ID.", 500)
+            proj_id = await asyncio.to_thread(get_user_project_id, creds)
+            if not proj_id:
+                return _error_response("Failed to get user project ID.", 500)
 
         await asyncio.to_thread(onboard_user, creds, proj_id)
 
@@ -110,22 +337,43 @@ async def send_gemini_request(
         )
 
         status = getattr(response, "status_code", None)
-        if status == 429 and attempt < max_retries - 1:
+        if status in RETRYABLE and attempt < max_retries - 1:
             record_usage(proj_id, False)
 
-            # Try to parse Google's retry delay from the response body
+            error_reason = None
             delay = None
             try:
                 body = getattr(response, "body", None)
                 if body:
-                    if isinstance(body, bytes):
-                        body = body.decode("utf-8", "ignore")
-                    delay = parse_retry_delay(body)
+                    body_str = body.decode("utf-8", "ignore") if isinstance(body, bytes) else body
+                    try:
+                        parsed = json.loads(body_str)
+                        error_reason = parsed.get("error", {}).get("reason")
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                    if not error_reason:
+                        error_reason = _extract_error_reason(body_str)
+                    if status == 429:
+                        delay = parse_retry_delay(body_str)
             except Exception:
                 pass
 
-            if delay is not None and delay > 0:
-                # Use Google's suggested delay, but cap at 30s
+            if error_reason == "MODEL_CAPACITY_EXHAUSTED":
+                delay = delay or 3.0
+                delay = min(delay * (1 + attempt * 0.5), 15.0)
+                logging.warning(
+                    f"MODEL_CAPACITY_EXHAUSTED on {proj_id}. "
+                    f"Server full — waiting {delay:.1f}s "
+                    f"({attempt + 1}/{max_retries})..."
+                )
+            elif status in (502, 503, 504):
+                delay = 1.0 + attempt * 0.5
+                logging.warning(
+                    f"{status} on project {proj_id}. "
+                    f"Transient error, retrying in {delay:.1f}s "
+                    f"({attempt + 1}/{max_retries})..."
+                )
+            elif delay is not None and delay > 0:
                 delay = min(delay, 30.0)
                 logging.warning(
                     f"429 on project {proj_id}. "
@@ -133,14 +381,12 @@ async def send_gemini_request(
                     f"Retry {attempt + 1}/{max_retries}..."
                 )
             elif attempt >= num_accounts:
-                # Second pass
                 delay = min(2 ** (attempt - num_accounts), 10)
                 logging.warning(
                     f"429 on project {proj_id}. "
                     f"Retry {attempt + 1}/{max_retries}, backoff {delay}s..."
                 )
             else:
-                # First pass
                 delay = 0
                 logging.warning(
                     f"429 on project {proj_id}. "
@@ -162,7 +408,7 @@ async def send_gemini_request(
 
         return response
 
-    return _error_response("All retry attempts exhausted (429).", 429)
+    return _error_response("All retry attempts exhausted.", 429)
 
 async def _wait_for_disconnect(event: asyncio.Event | None):
     """Wait until client disconnects. If no event, wait forever."""
@@ -170,7 +416,6 @@ async def _wait_for_disconnect(event: asyncio.Event | None):
         await asyncio.Future()  # never resolves
     else:
         await event.wait()
-
 
 # ===========================================================================
 #  Single-request logic
@@ -216,6 +461,19 @@ async def _send_single_request(
                 "POST", target_url, content=post_data, headers=request_headers
             )
             resp = await client.send(req, stream=True)
+
+            # For errors on streaming responses, read body BEFORE passing to handler
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                error_text = error_body.decode("utf-8", "ignore")
+                logging.error(
+                    f"Google API returned status {resp.status_code}. "
+                    f"Full response body:\n{error_text}"
+                )
+                await resp.aclose()
+                record_usage(proj_id, False)
+                return _error_response_from_google(resp.status_code, error_text)
+
             record_usage(proj_id, resp.status_code == 200)
             return _handle_streaming_response(resp, disconnect_event)
 
@@ -250,7 +508,6 @@ async def _send_single_request(
         logging.error(f"Unexpected error during Google API request: {e}")
         return _error_response(f"Unexpected error: {e}", 500)
 
-
 # ===========================================================================
 #  Streaming response — pure async, no threads, no queues
 # ===========================================================================
@@ -259,50 +516,19 @@ def _handle_streaming_response(
     resp: httpx.Response,
     disconnect_event: asyncio.Event = None,
 ) -> StreamingResponse:
-    """Handle streaming response. Clean async iteration."""
+    """Handle successful streaming response. Errors are handled upstream."""
 
-    if resp.status_code != 200:
-        error_message = f"Google API error: {resp.status_code}"
-        try:
-            body = resp.read()  # httpx sync read for error body
-            error_data = json.loads(body)
-            if "error" in error_data:
-                error_message = error_data["error"].get("message", error_message)
-        except Exception:
-            pass
-
-        async def error_generator():
-            await resp.aclose()
-            error_body = {
-                "error": {
-                    "message": error_message,
-                    "type": "invalid_request_error" if resp.status_code == 404 else "api_error",
-                    "code": resp.status_code,
-                }
-            }
-            yield f"event: error\ndata: {json.dumps(error_body)}\n\n".encode("utf-8")
-
-        logging.error(f"Google API returned status {resp.status_code}: {error_message}")
-
-        return StreamingResponse(
-            error_generator(),
-            media_type="text/event-stream",
-            headers=_sse_headers(),
-            status_code=resp.status_code,
-        )
-
+    # At this point resp.status_code is always 200
     async def stream_generator():
         last_data_time = asyncio.get_event_loop().time()
 
         try:
             async for line in resp.aiter_lines():
-                # Check disconnect
                 if disconnect_event and disconnect_event.is_set():
                     logging.info("Client disconnected, stopping stream.")
                     break
 
                 if not line:
-                    # Empty line — check if we need keep-alive
                     now = asyncio.get_event_loop().time()
                     if now - last_data_time > KEEPALIVE_INTERVAL:
                         yield ": keep-alive\n\n".encode("utf-8")
@@ -356,14 +582,23 @@ def _handle_streaming_response(
 # ===========================================================================
 
 def _handle_non_streaming_response(resp: httpx.Response) -> Response:
-    """Handle non-streaming response."""
     if resp.status_code == 200:
         try:
-            text = resp.text
+            text = resp.text.strip()
+
             if text.startswith("data: "):
                 text = text[len("data: "):]
+
             parsed = json.loads(text)
-            standard_response = parsed.get("response")
+            standard_response = parsed.get("response", parsed)
+
+            # Deduplicate overlapping parts
+            for candidate in standard_response.get("candidates", []):
+                content = candidate.get("content", {})
+                parts = content.get("parts", [])
+                if len(parts) > 1:
+                    content["parts"] = _deduplicate_parts(parts)
+
             return Response(
                 content=json.dumps(standard_response),
                 status_code=200,
@@ -371,37 +606,18 @@ def _handle_non_streaming_response(resp: httpx.Response) -> Response:
             )
         except (json.JSONDecodeError, AttributeError) as e:
             logging.error(f"Failed to parse Google API response: {e}")
+            # Pass through raw but strip compression headers
+            pass_headers = dict(resp.headers)
+            pass_headers.pop("content-encoding", None)
+            pass_headers.pop("content-length", None)
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
-                media_type=resp.headers.get("content-type"),
+                headers=pass_headers,
             )
     else:
         logging.error(f"Google API returned status {resp.status_code}: {resp.text}")
-        try:
-            error_data = resp.json()
-            if "error" in error_data:
-                error_message = error_data["error"].get("message", f"API error: {resp.status_code}")
-                return Response(
-                    content=json.dumps({
-                        "error": {
-                            "message": error_message,
-                            "type": "invalid_request_error" if resp.status_code == 404 else "api_error",
-                            "code": resp.status_code,
-                        }
-                    }),
-                    status_code=resp.status_code,
-                    media_type="application/json",
-                )
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type"),
-        )
-
+        return _error_response_from_google(resp.status_code, resp.text)
 
 # ===========================================================================
 #  Payload builders
@@ -480,36 +696,6 @@ def build_gemini_payload_from_native(native_request: dict, model_from_path: str)
         "model": get_base_model_name(model_from_path),
         "request": native_request,
     }
-
-
-# ===========================================================================
-#  Helpers
-# ===========================================================================
-
-def _sse_headers() -> dict:
-    """Standard SSE response headers."""
-    return {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Content-Disposition": "attachment",
-        "X-Accel-Buffering": "no",
-        "Vary": "Origin, X-Origin, Referer",
-        "X-XSS-Protection": "0",
-        "X-Frame-Options": "SAMEORIGIN",
-        "X-Content-Type-Options": "nosniff",
-        "Server": "ESF",
-    }
-
-
-def _error_response(message: str, status_code: int) -> Response:
-    """Build a JSON error response."""
-    return Response(
-        content=json.dumps({"error": {"message": message, "code": status_code}}),
-        status_code=status_code,
-        media_type="application/json",
-    )
-
 
 # ===========================================================================
 #  Usage stats

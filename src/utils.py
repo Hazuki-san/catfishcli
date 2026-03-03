@@ -4,7 +4,7 @@ import platform
 from .config import CLI_VERSION
 
 GEMINI_DUMMY_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
-GEMINI_API_CLIENT_HEADER = "google-genai-sdk/1.41.0 gl-node/v22.19.0"
+GEMINI_API_CLIENT_HEADER = "gl-node/25.6.1"
 
 def _get_nodejs_os():
     """Map Python platform to Node.js-style OS string."""
@@ -28,7 +28,7 @@ def _get_nodejs_arch():
 
 def get_user_agent(model: str = "unknown"):
     """Generate User-Agent string matching gemini-cli format."""
-    return f"GeminiCLI/{CLI_VERSION}/{model} ({_get_nodejs_os()}; {_get_nodejs_arch()})"
+    return f"GeminiCLI/{CLI_VERSION}/{model} ({_get_nodejs_os()}; {_get_nodejs_arch()}) google-api-nodejs-client/10.6.1"
 
 
 def get_platform_string():

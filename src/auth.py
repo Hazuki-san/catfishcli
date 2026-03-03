@@ -17,11 +17,14 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
-from .utils import get_user_agent, get_client_metadata
+from .utils import get_user_agent, get_client_metadata, GEMINI_API_CLIENT_HEADER
 from .config import (
     CLIENT_ID, CLIENT_SECRET, SCOPES, CREDENTIAL_FILE,
     CODE_ASSIST_ENDPOINT, GEMINI_AUTH_PASSWORD
 )
+
+CLOUD_AI_SERVICE = "cloudaicompanion.googleapis.com"
+SERVICE_USAGE_URL = "https://serviceusage.googleapis.com"
 
 # --- Global State for Account Polling ---
 ACCOUNTS = []
@@ -191,7 +194,7 @@ def save_credentials(creds, project_id=None):
 
 
 def get_credentials(allow_oauth_flow=True):
-    """Gets next available credentials with failover across accounts."""
+    """Gets next available credentials with failover. Skips unusable accounts."""
     if not ACCOUNTS:
         return _manual_oauth_flow() if allow_oauth_flow else None
 
@@ -203,6 +206,15 @@ def get_credentials(allow_oauth_flow=True):
             break
 
         project_id = selected_account.get("project_id", "unknown")
+
+        # Skip accounts marked as unusable
+        onboard_info = onboarding_complete_map.get(project_id, {})
+        if isinstance(onboard_info, dict) and onboard_info.get("unusable"):
+            logging.debug(
+                f"Skipping unusable account {project_id}: "
+                f"{onboard_info.get('status_message', '')}"
+            )
+            continue
 
         try:
             creds_info = selected_account.copy()
@@ -240,7 +252,6 @@ def get_credentials(allow_oauth_flow=True):
 
     logging.error("All accounts exhausted. No valid credentials available.")
     return None
-
 
 def get_user_project_id(creds):
     """Gets the user's project ID. Env var only used for single-account setups."""
@@ -288,12 +299,57 @@ def get_user_project_id(creds):
     except Exception as e:
         raise Exception(f"Failed to discover project ID: {e}")
 
+def _detect_tier(load_data: dict) -> str:
+    """
+    Detect account tier from loadCodeAssist response.
+    Returns: 'paid', 'free', 'workspace', 'legacy', or 'unknown'
+    """
+    current_tier = load_data.get("currentTier", {})
+    if isinstance(current_tier, dict):
+        tier_id = (current_tier.get("id") or "").lower().strip()
+    else:
+        tier_id = ""
+
+    if not tier_id:
+        for tier in load_data.get("allowedTiers", []):
+            if tier.get("isDefault"):
+                tier_id = (tier.get("id") or "").lower().strip()
+                break
+
+    if "standard" in tier_id:
+        return "paid"
+    elif "free" in tier_id:
+        return "free"
+    elif "legacy" in tier_id:
+        return "legacy"
+
+    return "unknown"
+
+
+def _is_free_tier(tier_id: str, load_data: dict) -> bool:
+    """Determine if this is a free-tier account based on actual tier detection."""
+    tier = _detect_tier(load_data)
+    return tier in ("free", "legacy")
 
 def onboard_user(creds, project_id):
-    """Ensures the user is onboarded."""
+    """
+    Ensures the user is onboarded. Detects unusable accounts
+    (missing license, warnings) and marks them accordingly.
+    """
     global onboarding_complete_map
-    if onboarding_complete_map.get(project_id):
-        return
+
+    existing = onboarding_complete_map.get(project_id)
+    if existing:
+        if isinstance(existing, dict):
+            if existing.get("complete"):
+                return
+            if existing.get("unusable"):
+                raise Exception(
+                    f"Account {project_id} is unusable: "
+                    f"{existing.get('status_message', 'unknown reason')}"
+                )
+        elif isinstance(existing, bool) and existing:
+            return
 
     headers = {
         "Authorization": f"Bearer {creds.token}",
@@ -301,50 +357,253 @@ def onboard_user(creds, project_id):
         "User-Agent": get_user_agent(),
     }
 
-    load_assist_payload = {
-        "cloudaicompanionProject": project_id,
-        "metadata": get_client_metadata(project_id),
+    metadata = {
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
     }
 
     try:
+        # Step 1: loadCodeAssist
+        load_payload = {
+            "cloudaicompanionProject": project_id,
+            "metadata": metadata,
+        }
+
         resp = httpx.post(
             f"{CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist",
-            data=json.dumps(load_assist_payload),
+            json=load_payload,
             headers=headers,
+            timeout=30,
         )
         resp.raise_for_status()
         load_data = resp.json()
 
+        tier = _detect_tier(load_data)
+        logging.info(f"Account tier for {project_id}: {tier}")
+
+        # Already onboarded
         if load_data.get("currentTier"):
-            onboarding_complete_map[project_id] = True
+            onboarding_complete_map[project_id] = {
+                "complete": True,
+                "tier": tier,
+            }
+            logging.info(f"Already onboarded: {project_id} (tier: {tier})")
             return
 
-        tier = None
+        # Find default tier ID
+        tier_id = "legacy-tier"
         for allowed_tier in load_data.get("allowedTiers", []):
             if allowed_tier.get("isDefault"):
-                tier = allowed_tier
+                tier_id = allowed_tier.get("id", tier_id)
                 break
 
-        if not tier:
-            tier = {"id": "legacy-tier"}
-
-        onboard_req_payload = {
-            "tierId": tier.get("id"),
+        # Step 2: onboardUser — poll until done
+        onboard_payload = {
+            "tierId": tier_id,
             "cloudaicompanionProject": project_id,
-            "metadata": get_client_metadata(project_id),
+            "metadata": metadata,
         }
 
-        onboard_resp = httpx.post(
-            f"{CODE_ASSIST_ENDPOINT}/v1internal:onboardUser",
-            data=json.dumps(onboard_req_payload),
-            headers=headers,
+        max_polls = 6
+        for poll in range(max_polls):
+            resp = httpx.post(
+                f"{CODE_ASSIST_ENDPOINT}/v1internal:onboardUser",
+                json=onboard_payload,
+                headers=headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            onboard_data = resp.json()
+
+            if onboard_data.get("done", False):
+                response_data = onboard_data.get("response", {})
+
+                logging.info(
+                    f"Onboarding response for {project_id}: "
+                    f"raw_response={json.dumps(response_data)}"
+                )
+
+                # Check for license/subscription warnings
+                onboard_status = response_data.get("status", {})
+                status_code = onboard_status.get("statusCode", "").upper()
+                status_message = onboard_status.get("displayMessage", "")
+                status_title = onboard_status.get("messageTitle", "")
+
+                if _is_unusable_account(status_code, status_message, status_title):
+                    logging.warning(
+                        f"Account {project_id} is UNUSABLE: "
+                        f"{status_title} — {status_message}"
+                    )
+                    onboarding_complete_map[project_id] = {
+                        "complete": False,
+                        "unusable": True,
+                        "tier": tier,
+                        "status_message": status_message or status_title,
+                    }
+                    raise Exception(
+                        f"Account {project_id} unusable: {status_message or status_title}"
+                    )
+
+                # Check for project remapping
+                response_project = _extract_response_project(onboard_data)
+                if response_project and response_project != project_id:
+                    if _is_free_tier(tier_id, load_data):
+                        logging.info(
+                            f"Free-tier project remapping: {project_id} → {response_project}"
+                        )
+                        _remap_project_id(creds, project_id, response_project)
+                        project_id = response_project
+                    elif project_id.startswith("gen-lang-client-"):
+                        logging.info(
+                            f"Auto-generated project remapping: "
+                            f"{project_id} → {response_project}"
+                        )
+                        _remap_project_id(creds, project_id, response_project)
+                        project_id = response_project
+                    else:
+                        logging.info(
+                            f"Pro account with custom project: keeping {project_id} "
+                            f"(Google suggested {response_project}, ignoring)"
+                        )
+
+                onboarding_complete_map[project_id] = {
+                    "complete": True,
+                    "tier": tier,
+                }
+                logging.info(f"Onboarding complete for project: {project_id} (tier: {tier})")
+
+                _ensure_cloud_ai_enabled(creds, project_id)
+                return
+
+            logging.info(
+                f"Onboarding in progress for {project_id}, "
+                f"waiting... ({poll + 1}/{max_polls})"
+            )
+            import time
+            time.sleep(5)
+
+        logging.warning(
+            f"Onboarding polling timed out for {project_id}, proceeding anyway."
         )
-        onboard_resp.raise_for_status()
-        onboarding_complete_map[project_id] = True
+        onboarding_complete_map[project_id] = {
+            "complete": True,
+            "tier": tier,
+        }
+
+    except httpx.HTTPStatusError as e:
+        raise Exception(
+            f"Onboarding failed for project {project_id}: "
+            f"{e.response.status_code} {e.response.text}"
+        )
+    except Exception as e:
+        # Re-raise so the retry loop catches it and skips this account
+        raise
+
+
+def _is_unusable_account(status_code: str, message: str, title: str) -> bool:
+    """
+    Detect if an onboarding response indicates the account can't use the API.
+    Catches missing licenses, subscription requirements, etc.
+    """
+    if status_code == "WARNING":
+        combined = (message + " " + title).lower()
+        unusable_signals = [
+            "missing a valid license",
+            "subscription needed",
+            "purchase or assign a license",
+            "not authorized",
+            "access denied",
+            "billing",
+        ]
+        return any(signal in combined for signal in unusable_signals)
+
+    if status_code in ("ERROR", "DENIED", "BLOCKED"):
+        return True
+
+    return False
+
+def _extract_response_project(onboard_data: dict) -> str | None:
+    """Extract project ID from onboardUser response, handling both string and dict formats."""
+    response = onboard_data.get("response", {})
+    project = response.get("    ")
+
+    if isinstance(project, str):
+        return project.strip() or None
+    elif isinstance(project, dict):
+        return (project.get("id") or "").strip() or None
+
+    return None
+
+
+def _remap_project_id(creds, old_project: str, new_project: str):
+    """
+    Update the account's project ID in memory and on disk when Google
+    remaps a free-tier project to a backend project.
+    """
+    with _account_lock:
+        for acc in ACCOUNTS:
+            if acc.get("refresh_token") == creds.refresh_token:
+                acc["project_id"] = new_project
+                logging.info(f"Remapped in-memory project: {old_project} → {new_project}")
+                break
+
+    save_credentials(creds, new_project)
+
+
+def _ensure_cloud_ai_enabled(creds, project_id: str):
+    """
+    Check if cloudaicompanion.googleapis.com is enabled.
+    Auto-enable it if not.
+    """
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json",
+        "User-Agent": get_user_agent(),
+    }
+
+    check_url = (
+        f"{SERVICE_USAGE_URL}/v1/projects/{project_id}"
+        f"/services/{CLOUD_AI_SERVICE}"
+    )
+
+    try:
+        resp = httpx.get(check_url, headers=headers, timeout=15)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("state") == "ENABLED":
+                logging.info(f"Cloud AI API already enabled for {project_id}")
+                return
+
+        # Try to enable it
+        enable_url = (
+            f"{SERVICE_USAGE_URL}/v1/projects/{project_id}"
+            f"/services/{CLOUD_AI_SERVICE}:enable"
+        )
+        resp = httpx.post(
+            enable_url,
+            json={},
+            headers=headers,
+            timeout=30,
+        )
+
+        if resp.status_code in (200, 201):
+            logging.info(f"Cloud AI API enabled for {project_id}")
+        elif resp.status_code == 400:
+            body = resp.text.lower()
+            if "already enabled" in body:
+                logging.info(f"Cloud AI API already enabled for {project_id}")
+            else:
+                logging.warning(f"Could not enable Cloud AI API for {project_id}: {resp.text}")
+        else:
+            logging.warning(
+                f"Could not enable Cloud AI API for {project_id}: "
+                f"{resp.status_code} {resp.text}"
+            )
 
     except Exception as e:
-        raise Exception(f"User onboarding failed for project {project_id}: {str(e)}")
-
+        logging.warning(f"Cloud AI API check failed for {project_id}: {e}")
 
 def get_accounts_status_snapshot():
     """Returns credential status snapshot for the dashboard."""
@@ -360,7 +619,9 @@ def get_accounts_status_snapshot():
 
             if expiry_raw:
                 try:
-                    expiry_dt = datetime.fromisoformat(str(expiry_raw).replace("Z", "+00:00"))
+                    expiry_dt = datetime.fromisoformat(
+                        str(expiry_raw).replace("Z", "+00:00")
+                    )
                     if not expiry_dt.tzinfo:
                         expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
                     expiry_iso = expiry_dt.astimezone(timezone.utc).isoformat()
@@ -368,20 +629,26 @@ def get_accounts_status_snapshot():
                 except Exception:
                     expiry_iso = str(expiry_raw)
 
+            onboard_info = onboarding_complete_map.get(project_id, {})
+            if isinstance(onboard_info, bool):
+                onboard_info = {"complete": onboard_info, "tier": "unknown"}
+
             items.append({
                 "project_id": project_id,
                 "has_refresh_token": bool(acc.get("refresh_token")),
                 "has_access_token": bool(acc.get("token") or acc.get("access_token")),
                 "expiry": expiry_iso,
                 "is_expired": is_expired,
-                "onboarding_complete": bool(onboarding_complete_map.get(project_id)),
+                "onboarding_complete": onboard_info.get("complete", False),
+                "tier": onboard_info.get("tier", "unknown"),
+                "unusable": onboard_info.get("unusable", False),
+                "status_message": onboard_info.get("status_message", ""),
             })
 
     return {
         "total_accounts": len(items),
         "accounts": items,
     }
-
 
 def _manual_oauth_flow():
     """Initiates the manual OAuth flow if no credentials file is found."""
