@@ -20,11 +20,16 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from .utils import get_user_agent, get_client_metadata, GEMINI_API_CLIENT_HEADER
 from .config import (
     CLIENT_ID, CLIENT_SECRET, SCOPES, CREDENTIAL_FILE,
-    CODE_ASSIST_ENDPOINT, GEMINI_AUTH_PASSWORD
+    CODE_ASSIST_ENDPOINT
 )
 
 CLOUD_AI_SERVICE = "cloudaicompanion.googleapis.com"
 SERVICE_USAGE_URL = "https://serviceusage.googleapis.com"
+
+
+def _expected_password() -> str:
+    """Return the expected auth password, read dynamically from the environment."""
+    return os.getenv("GEMINI_AUTH_PASSWORD", "123456")
 
 # --- Global State for Account Polling ---
 ACCOUNTS = []
@@ -91,18 +96,20 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 def authenticate_user(request: Request):
     """Authenticate the user with multiple methods."""
+    expected = _expected_password()
+
     api_key = request.query_params.get("key")
-    if api_key and api_key == GEMINI_AUTH_PASSWORD:
+    if api_key and api_key == expected:
         return "api_key_user"
 
     goog_api_key = request.headers.get("x-goog-api-key", "")
-    if goog_api_key and goog_api_key == GEMINI_AUTH_PASSWORD:
+    if goog_api_key and goog_api_key == expected:
         return "goog_api_key_user"
 
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         bearer_token = auth_header[7:]
-        if bearer_token == GEMINI_AUTH_PASSWORD:
+        if bearer_token == expected:
             return "bearer_user"
 
     if auth_header.startswith("Basic "):
@@ -110,7 +117,7 @@ def authenticate_user(request: Request):
             encoded_credentials = auth_header[6:]
             decoded_credentials = base64.b64decode(encoded_credentials).decode('utf-8', "ignore")
             username, password = decoded_credentials.split(':', 1)
-            if password == GEMINI_AUTH_PASSWORD:
+            if password == expected:
                 return username
         except Exception:
             pass

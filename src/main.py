@@ -1,8 +1,19 @@
+import os
+import sys
+
+# Load environment variables from .env file BEFORE importing any modules
+# that read env-derived config at import time (e.g. src.config, src.auth).
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+except Exception:
+    pass
+
 import asyncio
 import json
 import logging
-import os
-import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,22 +31,6 @@ from .auth import get_credentials, get_user_project_id, onboard_user, get_accoun
 from .google_api_client import get_formatted_stats, get_usage_stats_snapshot
 from . import dashboard_monitor
 from .config import DASHBOARD_TOKEN, CREDENTIAL_FILE
-
-# Load environment variables from .env file
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-    logging.info("Environment variables loaded from .env file")
-except ImportError:
-    logging.warning("python-dotenv not installed, .env file will not be loaded automatically")
-except Exception as e:
-    logging.warning(f"Could not load .env file: {e}")
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 
 app = FastAPI()
 
