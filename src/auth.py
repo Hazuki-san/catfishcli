@@ -141,6 +141,9 @@ def _update_account_in_memory(creds, project_id=None):
         for acc in ACCOUNTS:
             if acc.get("refresh_token") == creds.refresh_token:
                 acc["token"] = creds.token
+                refreshed_id_token = getattr(creds, "id_token", None)
+                if refreshed_id_token:
+                    acc["id_token"] = refreshed_id_token
                 if creds.expiry:
                     expiry_utc = (
                         creds.expiry.astimezone(timezone.utc)
@@ -168,6 +171,9 @@ def save_credentials(creds, project_id=None):
         for i, acc in enumerate(current_accounts):
             if acc.get("refresh_token") == creds.refresh_token:
                 current_accounts[i]["token"] = creds.token
+                refreshed_id_token = getattr(creds, "id_token", None)
+                if refreshed_id_token:
+                    current_accounts[i]["id_token"] = refreshed_id_token
                 if creds.expiry:
                     expiry_utc = (
                         creds.expiry.astimezone(timezone.utc)
