@@ -701,18 +701,20 @@ def _manual_oauth_flow():
             proj_id = None
             logging.error(f"Could not discover project ID during initial login: {e}")
 
+        id_token = _extract_id_token(new_creds)
         creds_data = [{
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
             "token": new_creds.token,
             "token_type": "Bearer",
-            "id_token": _extract_id_token(new_creds),
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
             "token_uri": "https://oauth2.googleapis.com/token",
             "expiry": new_creds.expiry.isoformat() if new_creds.expiry else None,
             "project_id": proj_id,
         }]
+        if id_token:
+            creds_data[0]["id_token"] = id_token
 
         with open(CREDENTIAL_FILE, "w") as f:
             json.dump(creds_data, f, indent=2)
@@ -767,18 +769,20 @@ def add_account_via_oauth() -> dict | None:
             proj_id = None
             logging.error(f"Could not discover project ID: {e}")
 
+        id_token = _extract_id_token(new_creds)
         new_account = {
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
             "token": new_creds.token,
             "token_type": "Bearer",
-            "id_token": _extract_id_token(new_creds),
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
             "token_uri": "https://oauth2.googleapis.com/token",
             "expiry": new_creds.expiry.isoformat() if new_creds.expiry else None,
             "project_id": proj_id,
         }
+        if id_token:
+            new_account["id_token"] = id_token
 
         with file_lock:
             try:
