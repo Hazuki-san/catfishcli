@@ -18,6 +18,7 @@ app_port: 7860
     "client_secret": "",
     "token": "",
     "token_type": "Bearer",
+    "id_token": "",
     "refresh_token": "",
     "scopes": [
       "https://www.googleapis.com/auth/cloud-platform",
@@ -33,6 +34,7 @@ app_port: 7860
     "client_secret": "",
     "token": "",
     "token_type": "Bearer",
+    "id_token": "",
     "refresh_token": "",
     "scopes": [
       "https://www.googleapis.com/auth/cloud-platform",
@@ -80,6 +82,7 @@ A FastAPI-based proxy server that converts the Gemini CLI tool into both OpenAI-
   "client_secret": "your-client-secret", 
   "token": "your-access-token",
   "token_type": "Bearer",
+  "id_token": "your-id-token",
   "refresh_token": "your-refresh-token",
   "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
   "token_uri": "https://oauth2.googleapis.com/token"
