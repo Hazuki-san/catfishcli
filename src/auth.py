@@ -20,11 +20,16 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from .utils import get_user_agent, get_client_metadata, GEMINI_API_CLIENT_HEADER
 from .config import (
     CLIENT_ID, CLIENT_SECRET, SCOPES, CREDENTIAL_FILE,
-    CODE_ASSIST_ENDPOINT, GEMINI_AUTH_PASSWORD
+    CODE_ASSIST_ENDPOINT
 )
 
 CLOUD_AI_SERVICE = "cloudaicompanion.googleapis.com"
 SERVICE_USAGE_URL = "https://serviceusage.googleapis.com"
+
+
+def _expected_password() -> str:
+    """Return the expected auth password, read dynamically from the environment."""
+    return os.getenv("GEMINI_AUTH_PASSWORD", "123456")
 
 # --- Global State for Account Polling ---
 ACCOUNTS = []
@@ -35,6 +40,15 @@ file_lock = threading.Lock()
 
 security = HTTPBasic()
 
+def _extract_id_token(creds):
+    """Extract optional OIDC id_token from credential objects."""
+    id_token = getattr(creds, "id_token", None)
+    if id_token:
+        return id_token
+    token_response = getattr(creds, "token_response", None)
+    if isinstance(token_response, dict):
+        return token_response.get("id_token")
+    return None
 
 def _load_accounts():
     """Loads all accounts from the credential file."""
@@ -91,18 +105,20 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 def authenticate_user(request: Request):
     """Authenticate the user with multiple methods."""
+    expected = _expected_password()
+
     api_key = request.query_params.get("key")
-    if api_key and api_key == GEMINI_AUTH_PASSWORD:
+    if api_key and api_key == expected:
         return "api_key_user"
 
     goog_api_key = request.headers.get("x-goog-api-key", "")
-    if goog_api_key and goog_api_key == GEMINI_AUTH_PASSWORD:
+    if goog_api_key and goog_api_key == expected:
         return "goog_api_key_user"
 
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         bearer_token = auth_header[7:]
-        if bearer_token == GEMINI_AUTH_PASSWORD:
+        if bearer_token == expected:
             return "bearer_user"
 
     if auth_header.startswith("Basic "):
@@ -110,7 +126,7 @@ def authenticate_user(request: Request):
             encoded_credentials = auth_header[6:]
             decoded_credentials = base64.b64decode(encoded_credentials).decode('utf-8', "ignore")
             username, password = decoded_credentials.split(':', 1)
-            if password == GEMINI_AUTH_PASSWORD:
+            if password == expected:
                 return username
         except Exception:
             pass
@@ -141,6 +157,9 @@ def _update_account_in_memory(creds, project_id=None):
         for acc in ACCOUNTS:
             if acc.get("refresh_token") == creds.refresh_token:
                 acc["token"] = creds.token
+                refreshed_id_token = _extract_id_token(creds)
+                if refreshed_id_token:
+                    acc["id_token"] = refreshed_id_token
                 if creds.expiry:
                     expiry_utc = (
                         creds.expiry.astimezone(timezone.utc)
@@ -168,6 +187,9 @@ def save_credentials(creds, project_id=None):
         for i, acc in enumerate(current_accounts):
             if acc.get("refresh_token") == creds.refresh_token:
                 current_accounts[i]["token"] = creds.token
+                refreshed_id_token = _extract_id_token(creds)
+                if refreshed_id_token:
+                    current_accounts[i]["id_token"] = refreshed_id_token
                 if creds.expiry:
                     expiry_utc = (
                         creds.expiry.astimezone(timezone.utc)
@@ -684,9 +706,11 @@ def _manual_oauth_flow():
             proj_id = None
             logging.error(f"Could not discover project ID during initial login: {e}")
 
+        id_token = _extract_id_token(new_creds)
         creds_data = [{
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
+            "token_type": "Bearer",
             "token": new_creds.token,
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
@@ -694,6 +718,8 @@ def _manual_oauth_flow():
             "expiry": new_creds.expiry.isoformat() if new_creds.expiry else None,
             "project_id": proj_id,
         }]
+        if id_token:
+            creds_data[0]["id_token"] = id_token
 
         with open(CREDENTIAL_FILE, "w") as f:
             json.dump(creds_data, f, indent=2)
@@ -748,9 +774,12 @@ def add_account_via_oauth() -> dict | None:
             proj_id = None
             logging.error(f"Could not discover project ID: {e}")
 
+        id_token = _extract_id_token(new_creds)
         new_account = {
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
+            "token_type": "Bearer",
+            "id_token": _extract_id_token(new_creds),
             "token": new_creds.token,
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
@@ -758,6 +787,9 @@ def add_account_via_oauth() -> dict | None:
             "expiry": new_creds.expiry.isoformat() if new_creds.expiry else None,
             "project_id": proj_id,
         }
+
+        if id_token:
+            new_account["id_token"] = id_token
 
         with file_lock:
             try:
