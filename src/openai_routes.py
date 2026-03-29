@@ -63,10 +63,10 @@ async def openai_chat_completions(
         )
 
     disconnect_event = asyncio.Event()
+    watcher = asyncio.create_task(_watch_disconnect(http_request, disconnect_event))
 
     if request.stream:
         async def openai_stream_generator():
-            watcher = asyncio.create_task(_watch_disconnect(http_request, disconnect_event))
             try:
                 response = await send_gemini_request(
                     gemini_payload,
@@ -164,10 +164,17 @@ async def openai_chat_completions(
                 yield f"data: {json.dumps(error_data)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
+                pass
+
+        async def _stream_and_cleanup():
+            try:
+                async for chunk in openai_stream_generator():
+                    yield chunk
+            finally:
                 watcher.cancel()
 
         return StreamingResponse(
-            openai_stream_generator(), media_type="text/event-stream"
+            _stream_and_cleanup(), media_type="text/event-stream"
         )
 
     else:
@@ -239,6 +246,8 @@ async def openai_chat_completions(
                 status_code=500,
                 media_type="application/json",
             )
+        finally:
+            watcher.cancel()
 
 
 @router.get("/v1/models")

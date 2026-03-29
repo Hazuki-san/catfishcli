@@ -37,7 +37,6 @@ def _wrap_with_disconnect(
     original_iterator = response.body_iterator
 
     async def wrapped_generator():
-        watcher = asyncio.create_task(_watch_disconnect(request, disconnect_event))
         try:
             async for chunk in original_iterator:
                 if disconnect_event.is_set():
@@ -45,7 +44,7 @@ def _wrap_with_disconnect(
                     break
                 yield chunk
         finally:
-            watcher.cancel()
+            pass
 
     return StreamingResponse(
         wrapped_generator(),
@@ -111,22 +110,30 @@ async def gemini_proxy(request: Request, full_path: str, username: str = Depends
         gemini_payload = build_gemini_payload_from_native(incoming_request, model_name)
 
         disconnect_event = asyncio.Event()
-        response = await send_gemini_request(
-            gemini_payload,
-            is_streaming=is_streaming,
-            disconnect_event=disconnect_event,
-        )
+        watcher = asyncio.create_task(_watch_disconnect(request, disconnect_event))
 
-        if is_streaming and isinstance(response, StreamingResponse):
-            response = _wrap_with_disconnect(response, request, disconnect_event)
+        try:
+            response = await send_gemini_request(
+                gemini_payload,
+                is_streaming=is_streaming,
+                disconnect_event=disconnect_event,
+            )
 
-        if hasattr(response, "status_code"):
-            if response.status_code != 200:
-                logging.error(f"Gemini API returned error: status={response.status_code}")
-            else:
-                logging.info(f"Successfully processed Gemini request for model: {model_name}")
+            if is_streaming and isinstance(response, StreamingResponse):
+                response = _wrap_with_disconnect(response, request, disconnect_event)
 
-        return response
+            if hasattr(response, "status_code"):
+                if response.status_code != 200:
+                    logging.error(f"Gemini API returned error: status={response.status_code}")
+                else:
+                    logging.info(f"Successfully processed Gemini request for model: {model_name}")
+
+            return response
+        finally:
+            if not (is_streaming and isinstance(response, StreamingResponse)):
+                # For non-streaming, cancel watcher immediately.
+                # For streaming, _wrap_with_disconnect handles it.
+                watcher.cancel()
 
     except Exception as e:
         logging.error(f"Gemini proxy error: {str(e)}")

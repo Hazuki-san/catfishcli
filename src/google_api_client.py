@@ -298,6 +298,10 @@ async def send_gemini_request(
     """
     Send a request to Google's Gemini API with quota-aware account selection,
     retry, and account rotation on failure.
+
+    MODEL_CAPACITY_EXHAUSTED errors are retried indefinitely (server will
+    eventually free up).  Other retryable errors (429 quota, 5xx) respect
+    max_retries.
     """
     num_accounts = len(ACCOUNTS) if ACCOUNTS else 1
     max_retries = num_accounts * 2
@@ -308,8 +312,9 @@ async def send_gemini_request(
 
     # First attempt: use quota-aware selection
     first_attempt = True
+    attempt = 0
 
-    for attempt in range(max_retries):
+    while True:
         if disconnect_event and disconnect_event.is_set():
             logging.info("Client disconnected, aborting retry loop.")
             return _error_response("Client disconnected.", 499)
@@ -337,9 +342,7 @@ async def send_gemini_request(
         )
 
         status = getattr(response, "status_code", None)
-        if status in RETRYABLE and attempt < max_retries - 1:
-            record_usage(proj_id, False)
-
+        if status in RETRYABLE:
             error_reason = None
             delay = None
             try:
@@ -358,13 +361,23 @@ async def send_gemini_request(
             except Exception:
                 pass
 
-            if error_reason == "MODEL_CAPACITY_EXHAUSTED":
+            is_capacity_exhausted = (error_reason == "MODEL_CAPACITY_EXHAUSTED")
+
+            # Capacity exhausted is not a real failure — don't pollute stats
+            if not is_capacity_exhausted:
+                record_usage(proj_id, False)
+
+            # For non-capacity errors, respect max_retries
+            if not is_capacity_exhausted and attempt >= max_retries - 1:
+                return response
+
+            if is_capacity_exhausted:
                 delay = delay or 3.0
                 delay = min(delay * (1 + attempt * 0.5), 15.0)
                 logging.warning(
                     f"MODEL_CAPACITY_EXHAUSTED on {proj_id}. "
                     f"Server full — waiting {delay:.1f}s "
-                    f"({attempt + 1}/{max_retries})..."
+                    f"(attempt {attempt + 1}, retrying until available)..."
                 )
             elif status in (502, 503, 504):
                 delay = 1.0 + attempt * 0.5
@@ -404,6 +417,7 @@ async def send_gemini_request(
                 except asyncio.TimeoutError:
                     pass
 
+            attempt += 1
             continue
 
         return response
@@ -581,6 +595,7 @@ def _handle_streaming_response(
 #  Non-streaming response
 # ===========================================================================
 
+
 def _handle_non_streaming_response(resp: httpx.Response) -> Response:
     if resp.status_code == 200:
         try:
@@ -591,13 +606,6 @@ def _handle_non_streaming_response(resp: httpx.Response) -> Response:
 
             parsed = json.loads(text)
             standard_response = parsed.get("response", parsed)
-
-            # Deduplicate overlapping parts
-            for candidate in standard_response.get("candidates", []):
-                content = candidate.get("content", {})
-                parts = content.get("parts", [])
-                if len(parts) > 1:
-                    content["parts"] = _deduplicate_parts(parts)
 
             return Response(
                 content=json.dumps(standard_response),
