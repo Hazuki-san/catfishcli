@@ -779,7 +779,6 @@ def add_account_via_oauth() -> dict | None:
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
             "token_type": "Bearer",
-            "id_token": _extract_id_token(new_creds),
             "token": new_creds.token,
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
