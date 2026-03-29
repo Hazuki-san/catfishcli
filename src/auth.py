@@ -36,6 +36,17 @@ file_lock = threading.Lock()
 security = HTTPBasic()
 
 
+def _extract_id_token(creds):
+    """Extract optional OIDC id_token from credential objects."""
+    id_token = getattr(creds, "id_token", None)
+    if id_token:
+        return id_token
+    token_response = getattr(creds, "token_response", None)
+    if isinstance(token_response, dict):
+        return token_response.get("id_token")
+    return None
+
+
 def _load_accounts():
     """Loads all accounts from the credential file."""
     global ACCOUNTS
@@ -141,7 +152,7 @@ def _update_account_in_memory(creds, project_id=None):
         for acc in ACCOUNTS:
             if acc.get("refresh_token") == creds.refresh_token:
                 acc["token"] = creds.token
-                refreshed_id_token = getattr(creds, "id_token", None)
+                refreshed_id_token = _extract_id_token(creds)
                 if refreshed_id_token:
                     acc["id_token"] = refreshed_id_token
                 if creds.expiry:
@@ -171,7 +182,7 @@ def save_credentials(creds, project_id=None):
         for i, acc in enumerate(current_accounts):
             if acc.get("refresh_token") == creds.refresh_token:
                 current_accounts[i]["token"] = creds.token
-                refreshed_id_token = getattr(creds, "id_token", None)
+                refreshed_id_token = _extract_id_token(creds)
                 if refreshed_id_token:
                     current_accounts[i]["id_token"] = refreshed_id_token
                 if creds.expiry:
@@ -695,7 +706,7 @@ def _manual_oauth_flow():
             "client_secret": CLIENT_SECRET,
             "token": new_creds.token,
             "token_type": "Bearer",
-            "id_token": getattr(new_creds, "id_token", None),
+            "id_token": _extract_id_token(new_creds),
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
             "token_uri": "https://oauth2.googleapis.com/token",
@@ -761,7 +772,7 @@ def add_account_via_oauth() -> dict | None:
             "client_secret": CLIENT_SECRET,
             "token": new_creds.token,
             "token_type": "Bearer",
-            "id_token": getattr(new_creds, "id_token", None),
+            "id_token": _extract_id_token(new_creds),
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
             "token_uri": "https://oauth2.googleapis.com/token",
