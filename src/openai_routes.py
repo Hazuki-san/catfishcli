@@ -251,8 +251,8 @@ async def openai_chat_completions(
 
 
 @router.get("/v1/models")
-async def openai_list_models(username: str = Depends(authenticate_user)):
-    """OpenAI-compatible models endpoint."""
+async def openai_list_models():
+    """OpenAI-compatible models endpoint — no auth required (metadata only)."""
     try:
         logging.info("OpenAI models list requested")
         from .config import SUPPORTED_MODELS

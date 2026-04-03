@@ -134,7 +134,6 @@ def authenticate_user(request: Request):
     raise HTTPException(
         status_code=401,
         detail="Invalid authentication credentials.",
-        headers={"WWW-Authenticate": "Basic"},
     )
 
 

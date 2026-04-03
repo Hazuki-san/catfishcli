@@ -55,8 +55,8 @@ def _wrap_with_disconnect(
 
 
 @router.get("/v1beta/models")
-async def gemini_list_models(request: Request, username: str = Depends(authenticate_user)):
-    """Native Gemini models endpoint."""
+async def gemini_list_models(request: Request):
+    """Native Gemini models endpoint — no auth required (metadata only)."""
     try:
         logging.info("Gemini models list requested")
         models_response = {"models": SUPPORTED_MODELS}
@@ -160,9 +160,9 @@ def _extract_model_from_path(path: str) -> str:
 
 
 @router.get("/v1/models")
-async def gemini_list_models_v1(request: Request, username: str = Depends(authenticate_user)):
+async def gemini_list_models_v1(request: Request):
     """Alternative models endpoint for v1 API version."""
-    return await gemini_list_models(request, username)
+    return await gemini_list_models(request)
 
 
 @router.get("/health")
