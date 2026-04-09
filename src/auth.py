@@ -50,6 +50,17 @@ def _extract_id_token(creds):
         return token_response.get("id_token")
     return None
 
+def _extract_id_token(creds):
+    """Extract optional OIDC id_token from credential objects."""
+    id_token = getattr(creds, "id_token", None)
+    if id_token:
+        return id_token
+    token_response = getattr(creds, "token_response", None)
+    if isinstance(token_response, dict):
+        return token_response.get("id_token")
+    return None
+
+
 def _load_accounts():
     """Loads all accounts from the credential file."""
     global ACCOUNTS
@@ -711,6 +722,7 @@ def _manual_oauth_flow():
             "client_secret": CLIENT_SECRET,
             "token_type": "Bearer",
             "token": new_creds.token,
+            "token_type": "Bearer",
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
             "token_uri": "https://oauth2.googleapis.com/token",
@@ -779,12 +791,15 @@ def add_account_via_oauth() -> dict | None:
             "client_secret": CLIENT_SECRET,
             "token_type": "Bearer",
             "token": new_creds.token,
+            "token_type": "Bearer",
             "refresh_token": new_creds.refresh_token,
             "scopes": list(new_creds.scopes) if new_creds.scopes else [],
             "token_uri": "https://oauth2.googleapis.com/token",
             "expiry": new_creds.expiry.isoformat() if new_creds.expiry else None,
             "project_id": proj_id,
         }
+        if id_token:
+            new_account["id_token"] = id_token
 
         if id_token:
             new_account["id_token"] = id_token
